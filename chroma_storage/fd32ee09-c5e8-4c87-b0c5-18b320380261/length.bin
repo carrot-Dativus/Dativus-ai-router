@@ -1,0 +1,1 @@
+invalid type: string "[Dativus 팀 1급 비밀 회의록]\n우리 팀의 프론트엔드 최고 에이스는 '홍길동'이고, 백엔드 지휘관은 '장보고'이다.\n이 프로젝트의 최종 목표는 전 세계 1등 협업 툴이 되는 것이다!", expected f64tring[] args){\r\n      Parent pa = <?> Child();\r\n      pa.show();\r\n   }\r\n}\r\n\r\n답 : new\r\n\r\n### 출력 결과 쓰기
