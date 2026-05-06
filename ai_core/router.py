@@ -1,163 +1,237 @@
 import os
-from langchain_ollama import ChatOllama
-from typing import TypedDict, Literal
+from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, END
-from database.chroma_manager import collection
-from sentence_transformers import SentenceTransformer
+from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
 
-# 모델 로딩 (라우터가 혼자 생각할 수 있도록 번역기를 달아줍니다)
-print("🧠 라우터용 임베딩 모델(BAAI/bge-m3) 로딩 중...")
+# 내부 모듈 임포트
+from database.chroma_manager import collection
+from database.postgres import get_user_persona
+
+load_dotenv()
+
+# ==========================================
+# 1. 모델 로딩 및 초기화
+# ==========================================
+print("라우터용 임베딩 모델(BAAI/bge-m3) 로딩 중...")
 model = SentenceTransformer('BAAI/bge-m3')
 
-# 👇 로컬 LLM(Llama-3) 엔진 세팅 추가!
-print("🤖 로컬 LLM(Llama-3) 연결 준비 중...")
-local_llm = ChatOllama(model="llama3", temperature=0) # temperature=0 은 가장 정확하고 진지하게 답하라는 뜻입니다!
+print("로컬 LLM (Llama-3) 연결 준비 중...")
+local_llm = ChatOllama(model="llama3", temperature=0)
 
-print("⚡ 외부 LLM(Groq) 연결 준비 중...")
+print("외부 LLM (Groq) 연결 준비 중...")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 external_llm = ChatGroq(
     temperature=0,
     groq_api_key=GROQ_API_KEY,
-    model_name="llama-3.1-8b-instant"  # Groq 서버에서 제공하는 초고속 Llama-3 모델
+    model_name="llama-3.1-8b-instant"
 )
 
-# 1. 상태(State) 정의: AI의 뇌혈관을 타고 흐를 데이터의 형태입니다.
+
+# ==========================================
+# 2. 상태(State) 정의 - (협업을 위한 기억 공간 추가!)
+# ==========================================
 class AgentState(TypedDict):
     query: str
-    workspace_id: str
+    workspace_id: Optional[str]
+    user_id: Optional[str]
+    persona: Optional[dict]
+
+    # 💡 에이전트끼리 주고받을 서류철 2개 추가!
+    context: Optional[str]  # 1번 요원이 2번 요원에게 줄 원본 자료
+    summary: Optional[str]  # 2번 요원이 3번 요원에게 줄 요약본
+
     final_answer: str
 
 
-# 2. 노드(행동) 함수들 정의: 각각의 도착지에서 AI가 할 행동입니다.
+# ==========================================
+# 3. 노드(Node) 함수 정의
+# ==========================================
+def initialize_persona_node(state: AgentState):
+    user_id = state.get("user_id")
+    persona = None
+    if user_id:
+        print(f"[시스템] 유저 ID({user_id})의 페르소나를 조회합니다...")
+        persona = get_user_persona(user_id)
+        if persona:
+            print(f"[시스템] 페르소나 장착 완료: {persona.get('tone', '')}")
+    return {"persona": persona}
+
+
 def greeting_node(state: AgentState):
-    print("👋 [Level 1] 인사말 노드 실행: 단순 인사말로 판별되었습니다.")
-    return {"final_answer": "안녕하세요! Dativus 팀 협업 AI입니다. 무엇을 도와드릴까요?"}
+    print("[Level 1] 인사말 노드 실행")
+    return {"final_answer": "안녕하세요! Dativus 팀 협업 AI Dati입니다. 무엇을 도와드릴까요?"}
 
 
-def rag_node(state: AgentState):
-    print("🗄️ [Level 2] RAG 검색 노드 실행: 팀 내부 지식을 탐색합니다.")
+# ----------------------------------------------------
+# 💡 [핵심 개조] 3인 1조 RAG 특수부대 파이프라인
+# ----------------------------------------------------
+
+# 요원 1: 자료 검색병 -> [Agent: Retriever]
+def search_node(state: AgentState):
+    print("[Agent: Retriever] ChromaDB 사내 지식베이스 수색 중...")
     query = state["query"]
-    workspace_id = state["workspace_id"]
+    workspace_id = state.get("workspace_id")
 
     query_embedding = model.encode(query).tolist()
-
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=1,
-        where={"workspace_id": workspace_id}
+        where={"workspace_id": workspace_id} if workspace_id else None
     )
 
     if not results['documents'] or not results['documents'][0]:
-        return {"final_answer": "ChromaDB를 뒤져봤지만, 해당 내용과 관련된 팀 지식을 찾지 못했습니다."}
+        return {"context": "관련 문서를 찾을 수 없습니다."}
 
     best_knowledge = results['documents'][0][0]
+    print("[Agent: Retriever] 자료 확보 완료! Summarizer에게 전달합니다.")
+    return {"context": best_knowledge}
 
-    # 🚨 프롬프트(명령서)를 더욱 강력하게 수정!
-    prompt = f"""[System]
-    당신은 Dativus 팀의 스마트하고 친절한 AI 어시스턴트입니다.
-    아래 [팀 지식]을 바탕으로 사용자의 [질문]에 대해 요약해서 답변하세요.
 
-    중요한 규칙:
-    1. 반드시 100% 한국어(Korean)로만 대답해야 합니다. 절대 영어를 사용하지 마세요.
-    2. 친절하고 자연스러운 대화체로 답변하세요.
+# 요원 2: 문서 요약병 -> [Agent: Summarizer]
+def summary_node(state: AgentState):
+    # 💡 텍스트만 바꾸는 게 아니라, 진짜로 외부망(Groq)을 끊고 내부망(Local)을 씁니다!
+    print("[Agent: Summarizer] 검색된 자료를 핵심만 정제 중 (Local Llama-3 가동)...")
+    context = state.get("context", "")
+    query = state["query"]
 
-    [팀 지식]: 
-    {best_knowledge}
+    if context == "관련 문서를 찾을 수 없습니다.":
+        return {"summary": "자료 없음"}
+
+    # 🚨 [보안 패치 1] 요약병에게 타 팀 검색 시도를 원천 차단하는 지시 하달
+    prompt = f"""당신은 Dativus 팀의 분석가입니다. 
+    다음 자료를 바탕으로 질문에 대한 핵심 정보만 3줄 이내로 간결하게 요약하세요.
+
+    [절대 보안 수칙]:
+    만약 사용자의 질문이 현재 워크스페이스가 아닌 다른 특정 팀(예: 거북선2팀, 타 부서 등)의 파일이나 정보를 요구하는 내용이라면, 원본 자료에 무슨 내용(코드 등)이 있든 절대 요약하지 말고 오직 "SECURITY_ALERT_CROSS_TEAM" 이라는 문구만 정확히 출력하세요.
 
     [질문]: {query}
-    """
+    [원본 자료]: {context}
+    [핵심 요약]:"""
 
-    print("💭 Llama-3가 문서를 읽고 답변을 작성 중입니다...")
-    # Llama-3 가동! (그래픽카드가 열일하는 순간)
+    # 🚨 [핵심 보안 수정] external_llm -> local_llm으로 완벽 교체! 기밀 데이터 외부 유출 원천 차단!
     response = local_llm.invoke(prompt)
+    print("[Agent: Summarizer] 요약 완료! Commander에게 보고서를 올립니다.")
+    return {"summary": response.content.strip()}
 
+
+# 요원 3: AI 어시스턴트 -> [Agent: Commander]
+def commander_node(state: AgentState):
+    print("[Agent: Commander] 요약 보고서를 바탕으로 최종 답변 스트리밍 준비 중 (Local Llama-3 가동)...")
+    persona = state.get("persona")
+    summary = state.get("summary", "")
+    query = state["query"]
+
+    # 🚨 [보안 패치 2] 요약병이 올린 보안 경고를 확인하면 즉시 방어 태세 돌입!
+    if "SECURITY_ALERT_CROSS_TEAM" in summary:
+        return {"final_answer": "🚨 [보안 경고] 타 워크스페이스(팀)의 데이터에는 접근할 권한이 없습니다."}
+
+    if summary == "자료 없음":
+        return {"final_answer": "해당 내용과 관련된 팀 지식을 찾지 못했습니다."}
+
+    # 💡 DB에서 가져온 페르소나가 있다면 적용하고, 없다면 '기본 AI 어시스턴트'로 동작!
+    if persona and (persona.get('decision_style') or persona.get('expertise') or persona.get('tone')):
+        system_msg = f"""당신은 Dativus 팀의 스마트한 AI 어시스턴트입니다.
+        사용자가 설정한 다음 페르소나에 맞춰 대답하세요:
+        - 판단 스타일: {persona.get('decision_style', '일반적인')}
+        - 전문 분야: {persona.get('expertise', '기본')}
+        - 어조: {persona.get('tone', '친절한')}"""
+    else:
+        system_msg = "당신은 Dativus 팀의 스마트하고 친절한 AI 어시스턴트입니다."
+
+    prompt = f"""{system_msg}
+    반드시 100% 한국어로만 대답하세요. 
+    당신은 사용자에게 기술적인 '코드의 원리'를 설명할 수는 있지만, 당신 스스로가 시스템 관리자처럼 타 팀의 데이터를 직접 꺼내줄 수는 없습니다. 자신이 할 수 없는 행동을 할 수 있다고 허풍떨지 마세요.
+
+    다음 '요약 보고서'를 바탕으로 사용자에게 답변하세요.
+
+    [요약 보고서]: {summary}
+    [사용자 질문]: {query}
+    [최종 답변]:"""
+
+    response = local_llm.invoke(prompt)
     return {"final_answer": response.content}
 
+
+# ----------------------------------------------------
 
 def external_llm_node(state: AgentState):
-    print("🧠 [Level 3] 외부 LLM 토론 노드 실행: Groq API를 호출합니다.")
+    print("[Level 3] 외부망 LLM (Groq) 실행 중...")
     query = state["query"]
+    persona = state.get("persona")
 
-    # 일반 지식을 묻는 질문이므로, 팀 지식(RAG) 없이 바로 질문을 던집니다.
-    prompt = f"""[System]
-당신은 Dativus 팀의 똑똑한 AI 어시스턴트입니다.
-사용자의 질문에 대해 친절하고 명확하게 '한국어(Korean)'로 답변해주세요.
+    if persona:
+        system_msg = f"어조: {persona.get('tone', '친절한')}에 맞춰 대답하세요."
+    else:
+        system_msg = "친절하게 대답하세요."
 
-[사용자 질문]: {query}
-"""
-    print("⚡ Groq가 초고속으로 답변을 생성 중입니다...")
+    prompt = f"{system_msg}\n\n[질문]: {query}"
     response = external_llm.invoke(prompt)
-
     return {"final_answer": response.content}
 
 
-# 3. 라우터(조건부 엣지) 함수: 어디로 갈지 길을 정해주는 핵심 '뇌'입니다!
-def route_query(state: AgentState):
+# ==========================================
+# 4. 교통경찰 (조건부 엣지 라우터)
+# ==========================================
+def route_query(state: AgentState) -> str:
     query = state["query"]
-    print(f"\n🤔 라우터 판단 중... 입력된 질문: '{query}'")
-
-    # 1. 인사말 컷 (Level 1)
+    print(f"\n라우터 판단 중... 질문: '{query}'")
+    print(f"[AI 교통경찰] 의도 분석 중... (TEAM vs GENERAL)")
     if "안녕" in query or "반가워" in query:
-        return "greeting_node"
+        return "greeting"
 
-    # 🚨 2. AI 교통경찰 출동 (의도 파악 프롬프트)
-    prompt = f"""당신은 사용자의 질문 의도를 분류하는 AI 라우터입니다.
-아래 질문을 읽고, 오직 'TEAM' 또는 'GENERAL' 중 하나의 단어만 출력하세요. 다른 말은 절대 하지 마세요.
+    prompt = f"""당신은 라우터입니다. 오직 'TEAM' 또는 'GENERAL' 중 하나만 출력하세요.
+    '문서', '파일', '업로드' 같은 단어가 있으면 무조건 TEAM 입니다.
+    [질문]: {query}
+    [결과]:"""
 
-[분류 기준]
-TEAM: 특정 팀, 회의록, 우리 프로젝트, 프론트엔드 에이스, 팀원, 비밀문서 등 '우리 팀 내부의 기밀이나 현황'을 묻는 질문
-GENERAL: 날씨, 일반적인 프로그래밍 지식(데이터베이스, 정규화 등), 상식 등 누구나 아는 외부 지식
-
-[질문]: {query}
-[결과]:"""
-
-    # 초고속 Groq에게 판단을 맡깁니다! (보안이 극도로 중요하다면 local_llm을 써도 됩니다)
-    print("🚦 AI 교통경찰이 질문의 의도를 분석 중입니다...")
     decision = external_llm.invoke(prompt).content.strip().upper()
-
-    # 3. 교통경찰의 판단에 따라 길을 엽니다!
     if "TEAM" in decision:
-        print("🎯 [교통경찰 판단] 팀 내부 지식입니다! -> Level 2(로컬 보안 AI)로 연결")
-        return "rag_node"
+        print("[SECURITY_CHECK] Classification: INTERNAL_DATA (Sensitive).")
+        print("[판단] ➔ 사내망 라우팅(Level 2). 외부 인터넷 연결 전면 차단.")
+        return "search"  # 💡 rag가 아니라 search(1번 요원)로 보냅니다!
     else:
-        print("🌐 [교통경찰 판단] 일반/외부 지식입니다! -> Level 3(외부 AI)로 연결")
-        return "external_llm_node"
+        print(f"[판단] ➔ 일반 지식(Level 3). 외부망(Groq) 라우팅 허용.")
+        return "external_llm"
 
 
-# 4. 그래프 조립하기 (LangGraph의 핵심!)
+# ==========================================
+# 5. 그래프 조립 (LangGraph)
+# ==========================================
 workflow = StateGraph(AgentState)
 
-# 노드 등록
-workflow.add_node("greeting_node", greeting_node)
-workflow.add_node("rag_node", rag_node)
-workflow.add_node("external_llm_node", external_llm_node)
+# (1) 모든 요원(노드) 등록
+workflow.add_node("initialize", initialize_persona_node)
+workflow.add_node("greeting", greeting_node)
+workflow.add_node("search", search_node)
+workflow.add_node("summary", summary_node)
+workflow.add_node("commander", commander_node)
+workflow.add_node("external_llm", external_llm_node)
 
-# 시작점을 라우터로 설정 (모든 질문은 라우터를 먼저 거칩니다)
-workflow.set_conditional_entry_point(route_query)
+# (2) 시작점
+workflow.set_entry_point("initialize")
 
-# 각 노드가 끝나면 무조건 종료(END)되도록 길을 연결
-workflow.add_edge("greeting_node", END)
-workflow.add_edge("rag_node", END)
-workflow.add_edge("external_llm_node", END)
+# (3) 교차로 (라우터)
+workflow.add_conditional_edges(
+    "initialize",
+    route_query,
+    {
+        "greeting": "greeting",
+        "search": "search",
+        "external_llm": "external_llm"
+    }
+)
 
-# 뇌 구조 완성!
-app = workflow.compile()
+# (4) 💡 3인 1조 릴레이 연결
+workflow.add_edge("search", "summary")
+workflow.add_edge("summary", "commander")
 
-# ==========================================
-# 🧪 테스트 코드 (이 파일만 단독으로 실행해서 확인해 봅니다)
-# ==========================================
-if __name__ == "__main__":
-    print("=== LangGraph 라우팅 테스트 시작 ===")
+# (5) 종착역
+workflow.add_edge("greeting", END)
+workflow.add_edge("commander", END)
+workflow.add_edge("external_llm", END)
 
-    test_queries = [
-        "안녕! 반가워",
-        "우리 팀 프론트엔드 에이스가 누구야?",  # <- 요런 거 하나 추가!
-        "데이터베이스 정규화가 뭐야?"
-    ]
-
-    REAL_WORKSPACE_ID = "fff7c64d-6da9-4bc8-a731-47b0f7e39dae"
-
-    for q in test_queries:
-        result = app.invoke({"query": q, "workspace_id": REAL_WORKSPACE_ID})
-        print(f"👉 최종 답변: {result['final_answer']}\n")
+# 앱 컴파일
+langgraph_app = workflow.compile()

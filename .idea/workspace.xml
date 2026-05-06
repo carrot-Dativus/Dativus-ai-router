@@ -5,8 +5,16 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="7edb9ed8-d565-4320-a892-c000b788243c" name="변경" comment="">
+      <change afterPath="$PROJECT_DIR$/database/postgres.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ai_core/router.py" beforeDir="false" afterPath="$PROJECT_DIR$/ai_core/router.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/chroma_storage/chroma.sqlite3" beforeDir="false" afterPath="$PROJECT_DIR$/chroma_storage/chroma.sqlite3" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/data_level0.bin" beforeDir="false" afterPath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/data_level0.bin" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/header.bin" beforeDir="false" afterPath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/header.bin" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/length.bin" beforeDir="false" afterPath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/length.bin" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/link_lists.bin" beforeDir="false" afterPath="$PROJECT_DIR$/chroma_storage/fd32ee09-c5e8-4c87-b0c5-18b320380261/link_lists.bin" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -31,17 +39,17 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.main.executor": "Run",
-    "Python.router.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.router.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;
   }
-}]]></component>
+}</component>
   <component name="RunManager">
     <configuration name="router" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="Dativus_Ai" />
