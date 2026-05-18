@@ -1,4 +1,4 @@
-from fastapi import BackgroundTasks,UploadFile, File, FastAPI, Depends, HTTPException, status, Form
+from fastapi import BackgroundTasks, UploadFile, File, FastAPI, Depends, HTTPException, status, Form
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import shutil
@@ -11,50 +11,41 @@ from dotenv import load_dotenv
 from database.chroma_manager import collection
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-import PyPDF2
-import io
 import uuid
 from pydantic import BaseModel
-
-# 💡 LangGraph 앱 임포트 (router.py에서 정의한 workflow)
+from typing import Optional
 from ai_core.router import langgraph_app
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware # 💡 1. CORS 도구 불러오기
+from fastapi.middleware.cors import CORSMiddleware
+import time # 💡 운영 로그 시간 측정을 위한 모듈
+from langchain_groq import ChatGroq
 
 app = FastAPI(title="Dativus AI Core API")
 
-# 💡 2. 리액트(브라우저)의 접근을 전면 허용하는 방어막 해제 코드!
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 주소 허용 (실전에서는 "http://localhost:5173" 등으로 제한)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # GET, POST, OPTIONS 등 모든 무전 방식 허용
-    allow_headers=["*"],  # 모든 헤더(토큰 등) 허용
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-# ... 기존 코드들 ...
-
-
 
 class ChatRequest(BaseModel):
     query: str
+    workspace_id: Optional[str] = None
+    history: Optional[list] = []
+    target_agent_name: Optional[str] = None
+    target_agent_prompt: Optional[str] = None
 
-
-# .env 파일 로드
 load_dotenv()
 
-# 1. 임베딩 모델 로딩
 print("임베딩 모델(BAAI/bge-m3) 로딩 중...")
 model = SentenceTransformer('BAAI/bge-m3')
 print("모델 로딩 완료!")
 
-# 2. 보안 검색대 세팅
 security = HTTPBearer()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM")
 
-
-# 🛡️ 3. JWT 검증 함수 (v4.0: user_id 추출 로직 강화)
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(
@@ -62,7 +53,6 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
             JWT_SECRET_KEY,
             algorithms=[JWT_ALGORITHM]
         )
-        # 💡 토큰에 user_id가 반드시 포함되어 있어야 합니다.
         if "user_id" not in payload:
             raise HTTPException(status_code=401, detail="토큰에 유저 식별 정보(user_id)가 없습니다.")
         return payload
@@ -72,41 +62,46 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
             detail="유효하지 않은 토큰입니다."
         )
 
-
 @app.get("/")
 def read_root():
     return {"message": "Dativus AI Core (FastAPI)가 정상 작동 중입니다! (Port 8000)"}
-
-
-# --- 실전 채팅 API (v4.0 페르소나 반영) ---
 
 @app.post("/api/v1/chat")
 async def chat_with_ai(
         request: ChatRequest,
         token_payload: dict = Depends(verify_token)
 ):
-    # 💡 토큰에서 유저 정보와 워크스페이스 정보를 추출
     user_id = token_payload.get("user_id")
     workspace_id = token_payload.get("workspace_id")
     print(f"\n==================================================================")
     print(f"[채팅 요청] 유저: {user_id} | 워크스페이스: {workspace_id}")
     print(f"\n==================================================================")
 
-    # 💡 LangGraph 호출 시 user_id를 넘겨주어 페르소나를 불러오게 합니다.
+    # 💡 [일반 채팅 운영 로그 기록 시작]
+    start_time = time.time()
+
     result = langgraph_app.invoke({
         "query": request.query,
         "workspace_id": workspace_id,
         "user_id": user_id
     })
 
+    # 💡 [일반 채팅 운영 로그 연산]
+    latency = round(time.time() - start_time, 2)
+    final_answer = result.get("final_answer", "")
+    estimated_tokens = int((len(request.query) + len(final_answer)) * 0.8)
+
+    print(f"⏱️ [운영 로그] 일반 동기식 답변 생성 완료.")
+    print(f"   ➔ 소요 시간: {latency}초 | 소모 토큰 추정: {estimated_tokens} Tokens")
+    print(f"==================================================================")
+
     return {
         "status": "success",
         "query": request.query,
-        "answer": result.get("final_answer")  # 💡 final_answer 로 변경!
+        "answer": final_answer,
+        "latency": latency,         # 프론트엔드 연동용 데이터 추가
+        "tokens": estimated_tokens   # 프론트엔드 연동용 데이터 추가
     }
-
-
-# --- 실전 스트리밍(SSE) 채팅 API (v4.0 페르소나 반영) ---
 
 @app.post("/api/v1/chat/stream")
 async def chat_with_ai_stream(
@@ -114,44 +109,108 @@ async def chat_with_ai_stream(
         token_payload: dict = Depends(verify_token)
 ):
     user_id = token_payload.get("user_id")
-    workspace_id = token_payload.get("workspace_id")
+    workspace_id = request.workspace_id or token_payload.get("workspace_id")
+
     print(f"\n==================================================================")
     print(f"[스트리밍 요청] 유저: {user_id} | 워크스페이스: {workspace_id}")
     print(f"\n==================================================================")
+
     async def event_generator():
+        # 💡 [스트리밍 운영 로그 기록 시작] 최고 관리자(Supervisor) 작전 타임 측정 시작
+        start_time = time.time()
+
         inputs = {
             "query": request.query,
             "workspace_id": workspace_id,
-            "user_id": user_id
+            "user_id": user_id,
+            "history": request.history,
+            "target_agent_name": request.target_agent_name,
+            "target_agent_prompt": request.target_agent_prompt
         }
 
-        # 💡 LangGraph의 비동기 스트림(astream)을 사용하여 페르소나가 반영된 답변 출력
+        node_kor_name = {
+            "initialize": "초기화(System)",
+            "greeting": "인사말 담당(Greeter)",
+            "supervisor": "최고 관리자(Supervisor)", # 💡 추가된 관리자 한글 매핑
+            "search": "자료 검색병(Retriever)",
+            "summary": "문서 요약병(Summarizer)",
+            "commander": "최종 커맨더(Commander)",
+            "external_llm": "외부망 연결(Groq)",
+            "custom_agent": "특수 빙의 요원(Ego)",
+            "critic": "품질 검수 요원(Critic)",
+            "web_search": "웹 검색병(Web Searcher)",
+            "graph_memory": "관계망 추론병(Graph Memory)" # 💡 추가된 관계망 요원 매핑
+        }
+
+        current_final_answer = ""
+
         async for event in langgraph_app.astream(inputs):
             for node_name, output in event.items():
-                if "final_answer" in output:  # 💡 final_answer 로 변경!
-                    final_text = output["final_answer"]
-                    # 타자기 효과를 위해 한 글자씩 전송
-                    for char in final_text:
+
+                if output and isinstance(output, dict) and "final_answer" in output:
+                    current_final_answer = output["final_answer"]
+
+                agent_name = node_kor_name.get(node_name, node_name)
+
+                if node_name == "critic":
+                    if output.get("feedback") == "PASS":
+                        yield f"data: [LOG]✅ [Critic] 검수 통과! 완벽한 답변입니다.\n\n"
+                    else:
+                        yield f"data: [LOG]❌ [Critic] 답변 반려 및 재작성 지시: {output.get('feedback')}\n\n"
+                    await asyncio.sleep(0.05)
+                else:
+                    yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
+                    await asyncio.sleep(0.05)
+
+                if output and isinstance(output, dict):
+                    if "team_context" in output and node_name == "search": # team_context 구조 반영
+                        yield f"data: [LOG]📄 사내 지식베이스 수색 및 관련 문서 조각 확보 완료.\n\n"
+                        await asyncio.sleep(0.05)
+                    if "web_context" in output and node_name == "web_search": # web_context 구조 반영
+                        yield f"data: [LOG]🌐 외부 웹망 실시간 데이터 크롤링 및 수집 완료.\n\n"
+                        await asyncio.sleep(0.05)
+                    if "team_context" in output and node_name == "graph_memory": # graph_memory 로그 세분화
+                        yield f"data: [LOG]🕸️ 문맥 내 핵심 Entity 간 유기적 관계성(Knowledge Graph) 추론 완료.\n\n"
+                        await asyncio.sleep(0.05)
+                    if "summary" in output and node_name == "summary":
+                        yield f"data: [LOG]📝 보안 검사 통과 및 지식 통합 브리핑 생성 완료.\n\n"
+                        await asyncio.sleep(0.05)
+
+                if node_name == "critic" and output.get("feedback") == "PASS":
+                    for char in current_final_answer:
+                        yield f"data: {char}\n\n"
+                        await asyncio.sleep(0.01)
+                elif node_name == "greeting" and "final_answer" in output:
+                    for char in current_final_answer:
                         yield f"data: {char}\n\n"
                         await asyncio.sleep(0.01)
 
+        # 💡 [스트리밍 최종 운영 로그 연산 레이어]
+        latency = round(time.time() - start_time, 2)
+        # 총 텍스트 길이를 바탕으로 현업 표준 텍스트 대 토큰 가중치(0.8)를 적용해 비용 산정
+        estimated_tokens = int((len(request.query) + len(current_final_answer)) * 0.8)
+
+        print(f"⏱️ [운영 로그] 스트리밍 전체 작전 종료.")
+        print(f"   ➔ 총 소요 시간: {latency}초 | 총 소모 토큰 추정: {estimated_tokens} Tokens")
+        print(f"==================================================================")
+
+        # 💡 [프론트엔드 전송 레이어] 실시간 화면 로그창에 대기업 솔루션처럼 속도와 비용 지표를 쏴줍니다!
+        yield f"data: [LOG]⏱️ 작전 소요 시간: {latency}초 | 🪙 소모 토큰: {estimated_tokens} Tokens\n\n"
+        await asyncio.sleep(0.05)
+
+        yield f"data: [LOG]🏁 모든 에이전트 통신 및 답변 생성 종료.\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-
-# --- 문서 업로드 API (기존 로직 유지) ---
-
 @app.post("/api/v1/documents/upload")
 async def upload_document(
-        background_tasks: BackgroundTasks,  # 🌟 핵심: 백그라운드 작업자 고용
-        document_id: str = Form(...),       # 💡 스프링이 꼬리표로 달아준 문서 ID 받기
+        background_tasks: BackgroundTasks,
+        document_id: str = Form(...),
         file: UploadFile = File(...),
         token_payload: dict = Depends(verify_token)
 ):
     workspace_id = token_payload.get("workspace_id")
-
-    # 1. 파일 임시 저장 (이건 1초도 안 걸립니다)
     UPLOAD_DIR = "temp_uploads"
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     file_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -159,24 +218,16 @@ async def upload_document(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # 2. 백그라운드 작업자에게 중노동(26초짜리)을 지시하고 우리는 빠집니다!
     background_tasks.add_task(process_and_store_document, file_path, file.filename, workspace_id, document_id)
 
-    # 3. 스프링(우체부)에게는 "접수 완료!" 라고 1초 만에 바로 응답 발사!
     return {
         "status": "success",
         "message": f"'{file.filename}' 파일 접수 완료! 백그라운드에서 AI 분석을 시작합니다."
     }
 
-
-# =====================================================================
-# 💡 [새로 추가된 함수] 26초 걸리는 중노동을 대신 해줄 '백그라운드 작업자'
-# =====================================================================
 def process_and_store_document(file_path: str, filename: str, workspace_id: str, document_id: str):
     try:
         print(f"[백그라운드] '{filename}' 파일 AI 뇌 각인 시작...")
-
-        # 1. 파일 읽기
         if filename.endswith(".pdf"):
             loader = PyPDFLoader(file_path)
             documents = loader.load()
@@ -186,11 +237,9 @@ def process_and_store_document(file_path: str, filename: str, workspace_id: str,
         else:
             return
 
-        # 2. 텍스트 쪼개기
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_documents(documents)
 
-        # 3. 임베딩 및 ChromaDB 저장
         ids = []
         embeddings = []
         metadatas = []
@@ -216,27 +265,20 @@ def process_and_store_document(file_path: str, filename: str, workspace_id: str,
         )
 
         print(f"[백그라운드] '{filename}' 분석 완료! 스프링(지휘소)으로 무전을 칩니다!")
-
-        # 4. 스프링 서버로 "완료(DONE)" 무전 발송!
         webhook_url = "http://127.0.0.1:8080/api/v1/documents/webhook"
         requests.post(webhook_url, json={"documentId": document_id, "status": "DONE"})
 
     except Exception as e:
         print(f"[백그라운드] 에러 발생: {e}")
-        # 실패하면 "실패(FAILED)" 무전 발송
         requests.post("http://127.0.0.1:8080/api/v1/documents/webhook",
                       json={"documentId": document_id, "status": "FAILED"})
-
     finally:
-        # 5. 다 쓴 임시 파일은 깨끗하게 삭제
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# --- 지식망 문서 삭제 (망각 API) ---
 @app.delete("/api/v1/documents")
 async def delete_document_vectors(workspace_id: str, file_name: str):
     try:
-        # 💡 [핵심] ChromaDB에서 '해당 방 번호'와 '해당 파일명'을 가진 조각들을 싹 다 찾아냅니다.
         collection.delete(
             where={
                 "$and": [
@@ -250,3 +292,42 @@ async def delete_document_vectors(workspace_id: str, file_name: str):
     except Exception as e:
         print(f"🚨 [망각 실패] {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+#--------------------------------------------------------------------------
+#프롬프트 자동 최적화
+#--------------------------------------------------------------------------
+class FailedLogItem(BaseModel):
+    query: str
+    answer: str
+
+class OptimizeRequest(BaseModel):
+    logs: list[FailedLogItem]
+
+@app.post("/api/v1/prompts/optimize")
+async def optimize_system_prompt(request: OptimizeRequest):
+    print("🧠 [Auto-Optimizer] 오답 노트 분석 및 프롬프트 자가 진화 시작...")
+
+    optimizer_llm = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.1-8b-instant")
+
+    log_text = ""
+    for i, log in enumerate(request.logs):
+        log_text += f"[{i + 1}번 실패 사례]\n- 사유: {log.query}\n- 답변: {log.answer}\n\n"
+
+    prompt = f"""당신은 Dativus 시스템의 프롬프트 최적화 수석 엔지니어입니다.
+    아래의 오답 노트를 보고, AI가 앞으로 절대 같은 실수를 하지 않도록 방어하는 [새로운 추가 규칙 1줄]을 작성하세요.
+
+    [오답 노트 기록]
+    {log_text}
+
+    반드시 문장 앞에 '-' 기호를 붙여 핵심 추가 규칙 딱 1줄만 출력하세요.
+    예시: - 데이터베이스 관련 기술 요약 브리핑 시 '진격'과 같은 가벼운 군대식 페르소나 단어 사용을 엄격히 금지할 것."""
+
+    new_rule = optimizer_llm.invoke(prompt).content.strip()
+
+    # 💡 [핵심] 기존 코드는 건드리지 않고, 새로 깨달은 규칙만 가벼운 파일에 한 줄씩 추가(Append)합니다.
+    with open("added_rules.txt", "a", encoding="utf-8") as f:
+        f.write(f"{new_rule}\n")
+
+    print(f"✨ [진화 완료] 시스템 신규 누적 규칙 각인: {new_rule}")
+    return {"status": "success", "new_rule": new_rule}
+
