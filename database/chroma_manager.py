@@ -20,5 +20,5 @@ collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"} # 유사도 검색 방식: 코사인 유사도
 )
 
-print(f"✅ ChromaDB 초기화 완료! (저장 경로: {CHROMA_DATA_PATH})")
-print(f"✅ 사용 중인 컬렉션: '{COLLECTION_NAME}'")
+print(f"[ChromaDB] 초기화 완료 (저장 경로: {CHROMA_DATA_PATH})")
+print(f"[ChromaDB] 사용 중인 컬렉션: '{COLLECTION_NAME}'")
