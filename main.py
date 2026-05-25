@@ -7,6 +7,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from fastapi import BackgroundTasks, UploadFile, File, FastAPI, Depends, HTTPException, status, Form, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import re
 import shutil
 import os
 import asyncio
@@ -54,8 +55,10 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     workspace_id: Optional[str] = None
     history: Optional[list] = []
-    target_agent_name: Optional[str] = None
-    target_agent_prompt: Optional[str] = None
+    force_agent: Optional[str] = None          # 빌트인 강제 라우팅 (general_agent / expert_agent / coding_math_agent)
+    target_agent_name: Optional[str] = None    # 커스텀 에이전트 이름 (수동 선택)
+    target_agent_prompt: Optional[str] = None  # 커스텀 에이전트 성격/역할 (수동 선택)
+    custom_agents_list: Optional[list] = []    # 자동 매칭용 전체 커스텀 에이전트 목록
     existing_dashboard: Optional[dict] = None
 
 
@@ -142,6 +145,54 @@ async def chat_with_ai(
     }
 
 
+def _send_webhook(url: str, document_id: str, status: str, bearer_token: str = ""):
+    """Spring 웹훅 호출 — Bearer 토큰 포함으로 403 방지."""
+    try:
+        headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
+        resp = requests.post(url, json={"documentId": document_id, "status": status}, headers=headers, timeout=10)
+        print(f"[웹훅] {status} 전송 → HTTP {resp.status_code} | documentId={document_id}")
+    except Exception as e:
+        print(f"[웹훅 실패] {e}")
+
+
+def _clean_final_answer(text: str) -> str:
+    """스트리밍 직전 — 알려진 프롬프트 오염 패턴을 제거."""
+    text = re.sub(r'\[사용자 질문[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'\[이전 대화[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'\[전 요원[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'\[출력 구조[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'^⚠️[^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+async def _stream_answer(text: str):
+    """코드 블록은 통째로, 일반 텍스트는 단어 단위로 스트리밍."""
+    # ``` 기준으로 코드 블록과 일반 텍스트 분리
+    segments = re.split(r'(```[\s\S]*?```)', text)
+    for seg in segments:
+        if seg.startswith('```'):
+            # 코드 블록 — 각 줄을 data: 필드로, 하나의 SSE 이벤트로 전송
+            # 프론트 파서가 data: 필드들을 \n으로 합쳐서 코드 블록 원형 복원
+            for line in seg.split('\n'):
+                yield f"data: {line}\n"
+            yield "\n"  # SSE 이벤트 종료
+            await asyncio.sleep(0.005)
+        else:
+            # 일반 텍스트 — 단어 단위 스트리밍
+            for part in re.split(r'(\n)', seg):
+                if part == '\n':
+                    yield "data: \n\n"
+                    await asyncio.sleep(0.003)
+                elif part:
+                    words = part.split(' ')
+                    for i, word in enumerate(words):
+                        token = word if i == len(words) - 1 else word + ' '
+                        if token:
+                            yield f"data: {token}\n\n"
+                            await asyncio.sleep(0.008)
+
+
 async def save_message_to_backend(session_id: str, user_id: str, sender_type: str,
                                    sender_name: str, content: str, is_private: bool,
                                    latency: float, tokens: int, bearer_token: str):
@@ -191,23 +242,30 @@ async def chat_with_ai_stream(
             "workspace_id": workspace_id,
             "user_id": user_id,
             "history": body.history,
-            "target_agent_name": body.target_agent_name,
-            "target_agent_prompt": body.target_agent_prompt,
+            "force_agent": body.force_agent or "",
+            "custom_agent_name": body.target_agent_name or "",
+            "custom_agent_prompt": body.target_agent_prompt or "",
+            "custom_agents_list": body.custom_agents_list or [],
             "existing_dashboard": body.existing_dashboard or {},
         }
 
         node_kor_name = {
-            "initialize": "초기화(System)",
-            "greeting": "인사말 담당(Greeter)",
-            "supervisor": "최고 관리자(Supervisor)",
-            "search": "자료 검색병(Retriever)",
-            "summary": "문서 요약병(Summarizer)",
-            "commander": "최종 커맨더(Commander)",
-            "external_llm": "일반 대화병(External)",
-            "custom_agent": "특수 빙의 요원(Ego)",
-            "critic": "품질 검수 요원(Critic)",
-            "web_search": "웹 검색병(Web Searcher)",
-            "graph_memory": "관계망 추론병(Graph Memory)"
+            "supervisor":           "최고 관리자",
+            "clarify":              "역질문 처리",
+            "conversation_memory":  "대화 기억병",
+            "general_agent":        "일반 대화병",
+            "code_search":          "레퍼런스 검색병",
+            "coding_math_agent":    "코딩/수학 전문병",
+            "search_coordinator":   "수색대 출격",
+            "search":               "자료 검색병",
+            "web_search":           "웹 검색병",
+            "graph_memory":         "관계망 추론병",
+            "expert_agent":         "전문 분석병",
+            "dashboard_select":     "대시보드 분석",
+            "summary":              "문서 요약병",
+            "critic":               "품질 검수 요원",
+            "revision_agent":       "재작성 요원",
+            "custom_agent_gate":    "커스텀 에이전트",
         }
 
         queue = asyncio.Queue()
@@ -277,10 +335,15 @@ async def chat_with_ai_stream(
                             elif node_name == "critic":
                                 critic_result = output.get("critic_feedback") if is_dict else None
                                 if critic_result == "PASS":
-                                    yield f"data: [LOG]✅ [Critic] 검수 통과! 완벽한 답변입니다.\n\n"
+                                    yield f"data: [LOG]✅ [품질 검수 요원] 검수 통과! 완벽한 답변입니다.\n\n"
                                 else:
                                     safe_feedback = str(critic_result or "").replace('\n', ' ')
-                                    yield f"data: [LOG]❌ [Critic] 답변 반려 및 재작성 지시: {safe_feedback}\n\n"
+                                    yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려 및 재작성 지시: {safe_feedback}\n\n"
+                            elif node_name == "custom_agent_gate" and is_dict:
+                                matched = output.get("matched_custom_agent_name", "")
+                                if matched:
+                                    yield f"data: [LOG]🎭 [{matched}] 관점 추가 완료.\n\n"
+                                # 매칭 없이 스킵된 경우 로그 생략
                             else:
                                 yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
 
@@ -294,13 +357,14 @@ async def chat_with_ai_stream(
                                     import json as _json
                                     yield f"data: [DASHBOARD]{_json.dumps(current_dashboard_data, ensure_ascii=False)}\n\n"
                                     await asyncio.sleep(0.01)
-                                for char in current_final_answer:
-                                    yield f"data: {char}\n\n"
-                                    await asyncio.sleep(0.01)
+                                # 스트리밍 전 경량 오염 클린업
+                                answer_to_stream = _clean_final_answer(current_final_answer)
+                                async for chunk in _stream_answer(answer_to_stream):
+                                    yield chunk
                             elif node_name == "greeting" and is_dict and "final_answer" in output:
-                                for char in current_final_answer:
-                                    yield f"data: {char}\n\n"
-                                    await asyncio.sleep(0.01)
+                                answer_to_stream = _clean_final_answer(current_final_answer)
+                                async for chunk in _stream_answer(answer_to_stream):
+                                    yield chunk
 
                 except asyncio.TimeoutError:
                     yield ": keep-alive ping\n\n"
@@ -335,12 +399,15 @@ async def chat_with_ai_stream(
 
 @app.post("/api/v1/documents/upload")
 async def upload_document(
+        request: Request,
         background_tasks: BackgroundTasks,
         document_id: str = Form(...),
         file: UploadFile = File(...),
         token_payload: dict = Depends(verify_token)
 ):
     workspace_id = token_payload.get("workspace_id")
+    # 업로드 요청의 Bearer 토큰을 백그라운드 태스크에 전달 → 웹훅 인증에 사용
+    bearer_token = request.headers.get("Authorization", "").replace("Bearer ", "")
     UPLOAD_DIR = "temp_uploads"
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     file_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -348,7 +415,7 @@ async def upload_document(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    background_tasks.add_task(process_and_store_document, file_path, file.filename, workspace_id, document_id)
+    background_tasks.add_task(process_and_store_document, file_path, file.filename, workspace_id, document_id, bearer_token)
 
     return {
         "status": "success",
@@ -356,7 +423,7 @@ async def upload_document(
     }
 
 
-def process_and_store_document(file_path: str, filename: str, workspace_id: str, document_id: str):
+def process_and_store_document(file_path: str, filename: str, workspace_id: str, document_id: str, bearer_token: str = ""):
     try:
         print(f"[백그라운드] '{filename}' 파일 AI 뇌 각인 시작...")
         if filename.endswith(".pdf"):
@@ -397,12 +464,11 @@ def process_and_store_document(file_path: str, filename: str, workspace_id: str,
 
         print(f"[백그라운드] '{filename}' 분석 완료! 스프링(지휘소)으로 무전을 칩니다!")
         webhook_url = "http://127.0.0.1:8080/api/v1/documents/webhook"
-        requests.post(webhook_url, json={"documentId": document_id, "status": "DONE"})
+        _send_webhook(webhook_url, document_id, "DONE", bearer_token)
 
     except Exception as e:
         print(f"[백그라운드] 에러 발생: {e}")
-        requests.post("http://127.0.0.1:8080/api/v1/documents/webhook",
-                      json={"documentId": document_id, "status": "FAILED"})
+        _send_webhook("http://127.0.0.1:8080/api/v1/documents/webhook", document_id, "FAILED", bearer_token)
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)

@@ -15,6 +15,7 @@ class AgentState(TypedDict):
     # 🧠 2. 핵심 라우팅 및 3분할 제어
     # ==========================================
     target_agent_name: str  # Supervisor가 배정한 부서 (general_agent, expert_agent, coding_math_agent)
+    force_agent: str       # 사용자가 수동 선택한 부서 (있으면 supervisor 스킵)
     fallback_mode: bool  # 🚨 외부 API(Groq) 토큰 소진 시 True로 변환 (전면 로컬 모드 발동)
 
     # ==========================================
@@ -45,3 +46,11 @@ class AgentState(TypedDict):
     clarify_question: str       # 사용자에게 보여줄 역질문
     clarify_options: list       # 선택지 목록
     clarify_multi_select: bool  # 다중 선택 허용 여부
+
+    # ==========================================
+    # 🎭 7. 커스텀 에이전트 (Custom Ego)
+    # ==========================================
+    custom_agent_name: str          # 수동 선택된 에이전트 이름
+    custom_agent_prompt: str        # 수동 선택된 에이전트 성격/역할
+    custom_agents_list: list        # 자동 매칭용 전체 에이전트 목록 [{name, description}, ...]
+    matched_custom_agent_name: str  # 실제 호출된 에이전트 이름 (대시보드 표시용)

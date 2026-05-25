@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 from typing import List, Optional, Union, Literal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from pydantic import BaseModel, Field
 
@@ -46,7 +47,12 @@ class DashboardResponse(BaseModel):
 # ==========================================
 model = SentenceTransformer('BAAI/bge-m3')
 local_llm = ChatOllama(model="llama3", temperature=0, num_predict=1500)
+# 라우팅 · Critic · 역질문 · 대시보드 — 속도 우선
 external_llm = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.1-8b-instant", max_tokens=1500)
+# 전문 분석 — 품질 우선 (70B)
+expert_llm   = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", max_tokens=2000)
+# 코딩/수학 · 재작성 — 정밀도 우선 (70B)
+coding_llm   = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", max_tokens=3000)
 
 
 # ==========================================
@@ -82,9 +88,20 @@ def format_history(history_list):
     for msg in history_list:
         is_user = msg.get("role") == "user"
         role = "지휘관" if is_user else "Dati(AI)"
-        # 사용자 발언은 400자, AI 응답은 200자 (AI 응답이 훨씬 길어 토큰 폭발 원인)
-        limit = 400 if is_user else 200
-        content = (msg.get('content') or '').replace('[skip] ', '')[:limit]
+        limit = 400 if is_user else 150
+        content = (msg.get('content') or '').replace('[skip] ', '')
+        if not is_user:
+            # AI 포맷 마커 제거 — 다음 프롬프트에 오염 방지
+            content = re.sub(r'^[①②③④⑤]\s*', '', content, flags=re.MULTILINE)
+            content = re.sub(r'^#{1,4}\s+', '', content, flags=re.MULTILINE)
+            content = re.sub(r'^>\s*', '', content, flags=re.MULTILINE)
+            content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+            # 프롬프트 내부 지시어가 AI 답변에 섞여 나온 경우 제거
+            content = re.sub(r'⚠️[^\n]*', '', content)
+            content = re.sub(r'\[사용자 질문[^\]]*\][^\n]*', '', content)
+            content = re.sub(r'\[이전 대화[^\]]*\][^\n]*', '', content)
+            content = re.sub(r'\[전 요원[^\]]*\][^\n]*', '', content)
+        content = content.strip()[:limit]
         formatted += f"{role}: {content}\n"
     return formatted + "\n"
 
@@ -113,13 +130,15 @@ _VAGUE_SHORT_VERBS = [
 _SAFE_FROM_CLARIFICATION = ["안녕", "감사", "고마워", "반가워", "수고", "잘있어", "bye", "hello"]
 
 
-def _needs_clarification_precheck(query: str) -> bool:
-    if '[추가 정보:' in query or '[skip]' in query:  # 이미 보강됐거나 건너뛴 쿼리
+def _needs_clarification_precheck(query: str, history_list: list = None) -> bool:
+    if '[추가 정보:' in query or '[skip]' in query:
         return False
-    if any(s in query for s in _SAFE_FROM_CLARIFICATION):  # 인사/일상 대화는 제외
+    if any(s in query for s in _SAFE_FROM_CLARIFICATION):
         return False
+    # 이전 대화 2턴 이상 → 지시 대명사는 맥락에서 해석 가능, 역질문 불필요
+    has_context = bool(history_list and len(history_list) >= 2)
     if any(t in query for t in _AMBIGUITY_TRIGGERS):
-        return True
+        return not has_context
     if len(query.strip()) <= 15 and any(v in query for v in _VAGUE_SHORT_VERBS):
         return True
     return False
@@ -187,6 +206,12 @@ _AGENT_EXAMPLES = {
         # 비즈니스 분석
         "경쟁사 대비 우리 제품 차별화 전략이 뭐야?",
         "신규 기능 도입 시 고려할 점이 뭐야?",
+        # 팀/조직 계획 — '짜줘'가 coding으로 잘못 라우팅되는 것 방지
+        "5명으로 팀 구성 계획 짜줘",
+        "6명으로 스타트업 조직도 짜줘",
+        "팀 역할 분배 다시 짜줘",
+        "인력 구성 새로 계획해줘",
+        "조직 구성 변경해줘",
     ],
     "coding_math_agent": [
         # 자료구조 조작 (coding으로 가야 하는 핵심 패턴)
@@ -221,7 +246,22 @@ _AGENT_EXAMPLES = {
         "수고했어", "고마워", "감사합니다", "도움이 됐어",
         "잘있어", "다음에 또 봐", "bye",
         "심심한데 얘기 좀 해줘", "잠깐 대화하자",
-        # 대화 기억/맥락 질문 — 이게 expert/coding으로 가면 엉뚱한 답 나옴
+        # 단순 개념 설명/정의 — "X가 뭐야?" / "X이란?" 형태 → general
+        "인공지능이 뭐야?", "인공지능이란 뭐야?",
+        "머신러닝이란 뭐야?", "머신러닝이 뭐야?",
+        "딥러닝이 뭐야?", "딥러닝이란?",
+        "블록체인이 뭐야?", "블록체인이란?",
+        "API가 뭐야?", "REST API가 뭐야?",
+        "클라우드가 뭔지 설명해줘", "클라우드가 뭐야?",
+        "애자일 방법론이 뭐야?", "애자일이란?",
+        "SaaS가 뭐야?", "SaaS란?",
+        "React가 뭐야?", "React란?",
+        "Vue가 뭐야?", "Vue.js가 뭐야?",
+        "Node.js가 뭐야?", "JavaScript가 뭐야?",
+        "TypeScript가 뭐야?", "Docker가 뭐야?",
+        "Kubernetes란?", "Git이 뭐야?",
+        "GraphQL이 뭐야?", "DevOps가 뭐야?",
+        # 대화 기억/맥락 질문
         "방금 내가 뭐 물어봤지?",
         "이전에 어떤 질문을 했었어?",
         "아까 말한 게 뭐야?",
@@ -259,13 +299,34 @@ def _semantic_score(query: str) -> dict:
     return scores
 
 
+# "X가 뭐야?" / "X이란?" 단순 정의 질문 → general_agent 직행
+_DEFINITION_RE = re.compile(
+    r'^[\w가-힣\s.#+/-]{1,25}\s*(?:이(?:란|란게|라는게)?|가|은|는)?\s*'
+    r'(?:뭐야|뭐야\?|뭔가요|뭔가요\?|뭔지|뭔지\?|무엇이야\??|무엇인가요\??)$',
+    re.IGNORECASE,
+)
+
+
 def supervisor_node(state):
     query = state["query"]
     history_str = format_history(state.get("history", []))
     print("\n[Supervisor] 시맨틱 라우팅으로 부서 분석 중...")
 
-    # --- 0단계: 지시 대명사 감지 → 역질문 트리거 ---
-    if _needs_clarification_precheck(query):
+    # --- 0단계: 사용자가 수동으로 부서를 선택한 경우 → supervisor 스킵 ---
+    _VALID_AGENTS = {"general_agent", "expert_agent", "coding_math_agent"}
+    force = state.get("force_agent", "")
+    if force in _VALID_AGENTS:
+        print(f"[Supervisor] 수동 선택 감지 → {force} 직행")
+        return {"target_agent_name": force, "fallback_mode": False}
+
+    # --- 1단계: 단순 정의 질문 패턴 → general_agent 직행 (시맨틱·LLM 생략) ---
+    if _DEFINITION_RE.match(query.strip()):
+        print(f"[Supervisor] 정의 질문 패턴 감지 → general_agent 직행")
+        return {"target_agent_name": "general_agent", "fallback_mode": False}
+
+    # --- 1단계: 지시 대명사 감지 → 역질문 트리거 ---
+    history_list = state.get("history", [])
+    if _needs_clarification_precheck(query, history_list):
         print(f"[Supervisor] 지시 대명사 감지 → 모호성 LLM 판단 중...")
         clarify = _check_and_generate_clarification(query, history_str)
         if clarify:
@@ -279,27 +340,24 @@ def supervisor_node(state):
                 "fallback_mode": False,
             }
 
-    # --- 1단계: 시맨틱 스코어링 (임베딩 코사인 유사도) ---
+    # --- 1단계: 시맨틱 점수를 힌트로 LLM에게 전달 → LLM이 항상 최종 결정 ---
     scores = _semantic_score(query)
-    best_agent = max(scores, key=scores.get)
-    best_score = scores[best_agent]
     print(f"[Semantic] 유사도: { {k: round(v,2) for k,v in scores.items()} }")
 
-    if best_score >= _SEMANTIC_THRESHOLD:
-        print(f"[Semantic] 신뢰도 충분 ({best_score:.2f}) → {best_agent} 직행 (LLM 생략)")
-        return {"target_agent_name": best_agent, "fallback_mode": False}
-
-    # --- 2단계: 유사도가 낮으면 LLM에게 최종 판단 위임 ---
-    print(f"[Semantic] 신뢰도 부족 ({best_score:.2f}) → LLM 판단 요청...")
     prompt = f"""당신은 Dativus 시스템의 라우팅 관리자입니다.
 사용자 질문을 보고 가장 적합한 부서를 단 1개만 출력하세요.
 
 [부서]
-- general_agent: 단순 인사, 안부, 짧은 일상 대화
-- expert_agent: 목표설정, 계획수립, 기술비교, 전략분석, 추천, 사내문서 관련
-- coding_math_agent: 코드작성, 에러수정, 수학계산
+- general_agent: 단순 인사·안부, 짧은 일상 대화, "X가 뭐야?" 같은 단순 개념 정의
+- expert_agent: 목표설정, 계획수립, 기술 비교·선택, 전략분석, 추천, 사내문서 관련
+- coding_math_agent: 코드 작성, 에러 수정, 알고리즘, 수학 계산
 
-[예시]
+[시맨틱 유사도 참고값] (높을수록 해당 부서 예시문장과 유사 — 최종 판단은 의도 우선)
+- general_agent: {scores['general_agent']:.2f}
+- expert_agent: {scores['expert_agent']:.2f}
+- coding_math_agent: {scores['coding_math_agent']:.2f}
+
+[판단 예시]
 "이 프로젝트 목표를 정해줘" → expert_agent
 "React vs Vue 비교해줘" → expert_agent
 "Python이랑 JavaScript 중 뭐 배우는 게 나아?" → expert_agent
@@ -308,7 +366,9 @@ def supervisor_node(state):
 "피보나치 수열 짜줘" → coding_math_agent
 "안녕하세요" → general_agent
 "방금 내가 뭐 물어봤지?" → general_agent
-"기억해?" → general_agent
+"React가 뭐야?" → general_agent  (시맨틱이 expert 높아도 의도는 단순 정의 → general)
+"딥러닝이란?" → general_agent
+"Docker가 뭔가요?" → general_agent
 
 질문: {query}
 출력(부서 이름만):"""
@@ -316,7 +376,7 @@ def supervisor_node(state):
     try:
         decision = external_llm.invoke(prompt).content.strip().lower()
         if decision not in ["general_agent", "expert_agent", "coding_math_agent"]:
-            decision = best_agent if best_score > 0 else "general_agent"
+            decision = "general_agent"
         print(f"[Supervisor] LLM 결정: {decision}")
         return {"target_agent_name": decision, "fallback_mode": False}
     except Exception as e:
@@ -324,7 +384,7 @@ def supervisor_node(state):
         try:
             decision = local_llm.invoke(prompt).content.strip().lower()
             if decision not in ["general_agent", "expert_agent", "coding_math_agent"]:
-                decision = best_agent if best_score > 0 else "general_agent"
+                decision = "general_agent"
             return {"target_agent_name": decision, "fallback_mode": True}
         except Exception:
             return {"target_agent_name": "general_agent", "fallback_mode": True}
@@ -338,32 +398,104 @@ def search_node(state: AgentState):
     workspace_id = state.get("workspace_id")
     print(f"🔍 [Vector Search] 사내망(ChromaDB)에서 '{query}' 관련 정보를 찾습니다...")
 
-    query_embedding = model.encode(query).tolist()
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=2,  # 관련도 높은 2개만 추출하여 토큰 절약
-        where={"workspace_id": workspace_id} if workspace_id else None
-    )
+    def _do_search():
+        query_embedding = model.encode(query).tolist()
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=2,
+            where={"workspace_id": workspace_id} if workspace_id else None
+        )
+        docs = results['documents'][0] if results['documents'] else ["관련 문서를 찾을 수 없습니다."]
+        return "\n".join(docs)
 
-    context_result = results['documents'][0] if results['documents'] else ["관련 문서를 찾을 수 없습니다."]
-    return {"search_context": "\n".join(context_result)}
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            search_context = executor.submit(_do_search).result(timeout=5.0)
+        return {"search_context": search_context}
+    except FuturesTimeoutError:
+        print("🔍 [Vector Search] 5초 타임아웃 — 빈 결과로 계속 진행")
+        return {"search_context": ""}
+    except Exception as e:
+        print(f"🔍 [Vector Search] 실패: {e}")
+        return {"search_context": ""}
 
 
 def web_search_node(state: AgentState):
     query = state["query"]
     print(f"🌐 [Web Search] DuckDuckGo를 통해 '{query}' 최신 정보를 수집합니다...")
 
-    search_tool = DuckDuckGoSearchResults(num_results=2)
-    search_result = search_tool.invoke(query)
-    return {"web_context": search_result}
+    def _do_search():
+        search_tool = DuckDuckGoSearchResults(num_results=3)
+        raw = search_tool.invoke(query)
+        snippets = re.findall(r'snippet:\s*([^,\]]+)', raw)
+        if snippets:
+            return ' '.join(s.strip() for s in snippets[:2])[:500]
+        return re.sub(r'https?://\S+', '', raw)[:400]
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            web_ctx = executor.submit(_do_search).result(timeout=8.0)
+        return {"web_context": web_ctx}
+    except FuturesTimeoutError:
+        print("🌐 [Web Search] 8초 타임아웃 — 빈 결과로 계속 진행")
+        return {"web_context": ""}
+    except Exception as e:
+        print(f"🌐 [Web Search] 검색 실패 (무시): {e}")
+        return {"web_context": ""}
+
+
+def search_coordinator_node(state: AgentState):
+    """VectorRAG / WebSearch / GraphRAG 3개 수색 노드를 병렬 실행하는 팬아웃 트리거."""
+    print("🚀 [검색 코디네이터] VectorRAG · WebSearch · GraphRAG 병렬 수색 시작...")
+    return {}
+
+
+def conversation_memory_node(state: AgentState):
+    """일반 대화팀 전용 — 이전 대화 맥락 확인 (LLM 없음, 빠름)."""
+    history_list = state.get("history", [])
+    if not history_list:
+        print("💬 [대화 기억] 이전 대화 없음")
+    else:
+        print(f"💬 [대화 기억] {len(history_list)}턴 대화 맥락 확인 완료")
+    return {}
+
+
+def code_search_node(state: AgentState):
+    """코딩팀 전용 레퍼런스 검색 — 업로드 문서에서 코드 예시 추출 (VectorRAG)."""
+    query = state["query"]
+    workspace_id = state.get("workspace_id")
+    print(f"📚 [레퍼런스 검색] 코드 예시·기술 문서 검색 중...")
+
+    def _do_search():
+        embedding = model.encode(query).tolist()
+        results = collection.query(
+            query_embeddings=[embedding],
+            n_results=2,
+            where={"workspace_id": workspace_id} if workspace_id else None
+        )
+        docs = results['documents'][0] if results['documents'] else []
+        return "\n".join(docs)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ctx = executor.submit(_do_search).result(timeout=5.0)
+        return {"search_context": ctx}
+    except FuturesTimeoutError:
+        print("📚 [레퍼런스 검색] 5초 타임아웃")
+        return {"search_context": ""}
+    except Exception as e:
+        print(f"📚 [레퍼런스 검색] 실패: {e}")
+        return {"search_context": ""}
 
 
 def graph_memory_node(state: AgentState):
-    query = state["query"]
-    history_str = format_history(state.get("history", []))
-    # 전처리 단계이므로 항상 로컬 Ollama 사용 → Groq TPM 절약
-    active_llm = local_llm
+    history_list = state.get("history", [])
+    if not history_list:
+        print("🕸️ [GraphRAG] 이전 대화 없음 — 건너뜀")
+        return {"graph_context": ""}
 
+    query = state["query"]
+    history_str = format_history(history_list)
     print("🕸️ [GraphRAG] 대화 맥락과 유기적 관계(Entity-Relation)를 분석합니다...")
 
     prompt = f"""당신은 '지식 그래프(Knowledge Graph) 분석가'입니다.
@@ -373,8 +505,20 @@ def graph_memory_node(state: AgentState):
     [이전 대화 맥락]: {history_str}
     [사용자 질문]: {query}
     """
-    graph_memory = active_llm.invoke(prompt).content
-    return {"graph_context": graph_memory}
+
+    def _do_graph():
+        return local_llm.invoke(prompt).content
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            graph_memory = executor.submit(_do_graph).result(timeout=10.0)
+        return {"graph_context": graph_memory}
+    except FuturesTimeoutError:
+        print("🕸️ [GraphRAG] 10초 타임아웃 — 빈 컨텍스트로 계속 진행")
+        return {"graph_context": ""}
+    except Exception as e:
+        print(f"🕸️ [GraphRAG] 실패: {e}")
+        return {"graph_context": ""}
 
 
 # ==========================================
@@ -384,7 +528,7 @@ def expert_agent_node(state: AgentState):
     query = state["query"]
     history_str = format_history(state.get("history", []))
     fallback_mode = state.get("fallback_mode", False)
-    active_llm = local_llm if fallback_mode else external_llm
+    active_llm = local_llm if fallback_mode else expert_llm
 
     search_ctx = (state.get("search_context", "") or "")[:500]
     web_ctx = (state.get("web_context", "") or "")[:300]
@@ -454,12 +598,12 @@ def coding_math_agent_node(state: AgentState):
     query = state["query"]
     history_str = format_history(state.get("history", []))
     fallback_mode = state.get("fallback_mode", False)
-    active_llm = local_llm if fallback_mode else external_llm
+    active_llm = local_llm if fallback_mode else coding_llm
+    search_ctx = (state.get("search_context", "") or "")[:400]
 
     clarify_hint = ""
     if '[추가 정보:' in query:
-        import re as _re
-        tags = _re.findall(r'\[추가 정보:\s*([^\]]+)\]', query)
+        tags = re.findall(r'\[추가 정보:\s*([^\]]+)\]', query)
         if tags:
             clarify_hint = f"\n[역질문 선택 결과 - 반드시 이 주제를 중심으로 답변]: {', '.join(tags)}\n"
 
@@ -471,6 +615,7 @@ def coding_math_agent_node(state: AgentState):
     ⚠️ 반드시 [사용자 질문]에만 답하세요. 이전 대화는 맥락 참고용이며, 이전 대화 내용을 그대로 반복하거나 재생성하지 마세요.
     {clarify_hint}
     {history_str}
+    [참고 문서(레퍼런스)]: {search_ctx if search_ctx else '없음'}
     [사용자 질문]: {query}
     """
     response = _invoke_with_backoff(active_llm, prompt).content
@@ -599,13 +744,28 @@ def critic_node(state: AgentState):
         print("🚨 [Critic] 수정 한도 도달. 시스템 과부하 방지를 위해 강제 PASS!")
         return {"final_answer": draft_answer, "critic_feedback": "PASS"}
 
-    print(f"🧐 [Critic] 로컬(Ollama) 엔진으로 품질 검사 중... (현재 수정: {count}회)")
+    # general_agent 답변은 짧은 대화 — Critic 불필요, 바로 통과
+    if state.get("target_agent_name") == "general_agent":
+        print("✅ [Critic] 일반 대화 — 검수 생략")
+        return {"final_answer": draft_answer, "critic_feedback": "PASS"}
 
-    # 하드코딩 삭제하고 prompts.py의 변수 사용
-    prompt = CRITIC_SYSTEM_PROMPT.format(query=state.get("query", ""), draft=draft_answer)
+    # 코딩 응답에 코드 블록이 없으면 즉시 FAIL (결정론적, LLM 불필요)
+    if state.get("target_agent_name") == "coding_math_agent" and "```" not in draft_answer:
+        msg = "FAIL: 코드 블록(```)이 누락되었습니다. 반드시 실제 코드를 ```언어명 ... ``` 형식으로 포함하세요."
+        print(f"❌ [Critic] 코드 블록 없음 → 즉시 반려")
+        return {"critic_feedback": msg, "revision_count": count + 1}
+
+    print(f"🧐 [Critic] Groq 엔진으로 품질 검사 중... (현재 수정: {count}회)")
+
+    # 앞 700자(구조 확인) + 뒤 300자(Next Step 확인)
+    if len(draft_answer) > 1000:
+        critic_draft = draft_answer[:700] + "\n...(중략)...\n" + draft_answer[-300:]
+    else:
+        critic_draft = draft_answer
+    prompt = CRITIC_SYSTEM_PROMPT.format(query=state.get("query", ""), draft=critic_draft)
 
     try:
-        decision = local_llm.invoke(prompt).content.strip().upper()
+        decision = _invoke_with_backoff(external_llm, prompt).content.strip().upper()
         if "PASS" in decision:
             print("✅ [Critic] 검수 통과!")
             return {"final_answer": draft_answer, "critic_feedback": "PASS"}
@@ -622,18 +782,26 @@ def revision_agent_node(state: AgentState):
     draft = state.get("draft_answer", "")
     feedback = state.get("critic_feedback", "")
     fallback_mode = state.get("fallback_mode", False)
-    active_llm = local_llm if fallback_mode else external_llm
+    # 재작성은 품질이 중요 — Critic 지적을 정확히 반영해야 하므로 70B 사용
+    active_llm = local_llm if fallback_mode else coding_llm
 
     print("🛠️ [개선/보충 대화병] Critic의 지적을 반영하여 초안을 긴급 수정합니다.")
 
-    # 다시 작성할 때도 하네스 룰 강제 주입
     prompt = f"""[전 요원 필독 하네스 룰]\n{get_dynamic_harness()}\n
-    당신은 답변 수정 요원입니다.
-    🚨 [지적사항]: {feedback}
-    [사용자 질문]: {query}
-    위 지적사항만 반영해서 답변을 새로 작성하세요.
-    JSON, 코드 블록, 대시보드, 수치 목록은 절대 포함하지 마세요. (시스템이 자동 처리)
-    서론("수정된 답변:", "아래와 같이" 등) 없이 바로 본문만 출력하세요."""
+당신은 답변 수정 요원입니다.
+
+[원본 답변]:
+{draft}
+
+🚨 [지적사항]: {feedback}
+
+[사용자 질문]: {query}
+
+규칙:
+- 위 [원본 답변]에서 [지적사항]에 해당하는 부분만 최소한으로 수정하세요.
+- 지적받지 않은 부분은 원문 그대로 유지하세요. 멀쩡한 내용을 바꾸거나 삭제하지 마세요.
+- JSON, 대시보드 데이터는 포함하지 마세요. (시스템이 자동 처리)
+- 서론("수정된 답변:", "아래와 같이" 등) 없이 수정된 본문만 출력하세요."""
 
     response = active_llm.invoke(prompt).content
     return {"draft_answer": response}
@@ -643,6 +811,66 @@ def check_critic_approval(state: AgentState):
     if "PASS" in state.get("critic_feedback", ""):
         return "end"
     return "revision"
+
+
+# ==========================================
+# 🎭 커스텀 에이전트 게이트 (Custom Ego Gate)
+# ==========================================
+_CUSTOM_AGENT_AUTO_THRESHOLD = 0.38  # 이 유사도 이상이면 자동 선택
+
+
+def custom_agent_gate_node(state: AgentState):
+    """커스텀 에이전트 게이트 — 수동 선택 또는 자동 매칭 후 메인 답변 뒤에 관점 추가."""
+    query = state["query"]
+    draft = state.get("draft_answer", "")
+    history_str = format_history(state.get("history", []))
+    fallback_mode = state.get("fallback_mode", False)
+    active_llm = local_llm if fallback_mode else expert_llm  # 70B 품질 우선, 소진 시 로컬 폴백
+
+    # 1. 수동 선택된 에이전트 우선
+    agent_name = state.get("custom_agent_name", "")
+    agent_prompt = state.get("custom_agent_prompt", "")
+
+    # 2. 수동 선택 없으면 자동 매칭
+    if not agent_name or not agent_prompt:
+        agents_list = state.get("custom_agents_list", [])
+        if not agents_list:
+            return {}
+
+        query_vec = model.encode(query, normalize_embeddings=True)
+        best_score, best_agent = 0.0, None
+        for agent in agents_list:
+            desc = agent.get("description", "")
+            if not desc:
+                continue
+            desc_vec = model.encode(desc, normalize_embeddings=True)
+            score = float(np.dot(query_vec, desc_vec))
+            if score > best_score:
+                best_score, best_agent = score, agent
+
+        if best_agent and best_score >= _CUSTOM_AGENT_AUTO_THRESHOLD:
+            agent_name = best_agent["name"]
+            agent_prompt = best_agent["description"]
+            print(f"🎭 [커스텀 에이전트 자동 선택] '{agent_name}' (유사도: {best_score:.2f})")
+        else:
+            print(f"🎭 [커스텀 에이전트] 매칭 없음 (최고 유사도: {best_score:.2f}) — 스킵")
+            return {}
+
+    print(f"🎭 [커스텀 에이전트: {agent_name}] 관점 추가 중...")
+    prompt = CUSTOM_AGENT_PROMPT.format(
+        agent_name=agent_name,
+        agent_prompt=agent_prompt,
+        history_str=history_str,
+        query=query,
+    )
+
+    try:
+        opinion = _invoke_with_backoff(active_llm, prompt).content.strip()
+        appended = f"{draft}\n\n> 💡 **[{agent_name}]:** {opinion}"
+        return {"draft_answer": appended, "matched_custom_agent_name": agent_name}
+    except Exception as e:
+        print(f"🎭 [커스텀 에이전트] 실패 (무시): {e}")
+        return {}
 
 
 # ==========================================
