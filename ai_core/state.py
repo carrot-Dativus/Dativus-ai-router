@@ -54,3 +54,13 @@ class AgentState(TypedDict):
     custom_agent_prompt: str        # 수동 선택된 에이전트 성격/역할
     custom_agents_list: list        # 자동 매칭용 전체 에이전트 목록 [{name, description}, ...]
     matched_custom_agent_name: str  # 실제 호출된 에이전트 이름 (대시보드 표시용)
+    multi_agent_responses: list     # 다중 매칭 시 각 에이전트 응답 [{name, response}, ...]
+
+    # ==========================================
+    # 🧬 8. 사용자 개인화 (Personalization) — Phase 1: 자유 입력형
+    # ==========================================
+    # Phase 1 (현재): 사용자가 직접 자연어로 AI 성향을 지시 → GLOBAL_HARNESS에 주입
+    # TODO Phase 2: 피드백(👍/👎) 누적 데이터 자동 분석 → 개인화 패턴을 학습하여
+    #   사용자별 맞춤 대시보드로 시각화 (자동학습형 개인화, 별도 백그라운드 파이프라인 필요)
+    persona_memo: str  # 사용자가 마이페이지에서 입력한 자유 형식 AI 지시문
+

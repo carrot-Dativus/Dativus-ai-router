@@ -24,6 +24,7 @@ workflow.add_node("expert_agent", expert_agent_node) # Logic Worker 역할
 workflow.add_node("custom_agent_gate", custom_agent_gate_node)
 workflow.add_node("dashboard_select", dashboard_select_node)
 workflow.add_node("summary", summary_node)
+workflow.add_node("persona_agent", persona_agent_node)
 workflow.add_node("critic", critic_node)
 workflow.add_node("revision_agent", revision_agent_node)
 
@@ -67,7 +68,8 @@ workflow.add_edge("custom_agent_gate", "dashboard_select")
 
 # (이하 대시보드 ➔ Summary ➔ Critic ➔ END 로직은 이전과 완벽히 동일)
 workflow.add_edge("dashboard_select", "summary")
-workflow.add_edge("summary", "critic")
+workflow.add_edge("summary", "persona_agent")
+workflow.add_edge("persona_agent", "critic")
 workflow.add_conditional_edges("critic", check_critic_approval, {"end": END, "revision": "revision_agent"})
 workflow.add_edge("revision_agent", "dashboard_select")
 

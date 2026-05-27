@@ -4,6 +4,7 @@ import requests
 import asyncio
 import json
 import time
+import threading
 from typing import List, Optional, Union, Literal
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
@@ -56,30 +57,70 @@ coding_llm   = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), m
 
 
 # ==========================================
+# 📡 SSE 로그 버퍼 — main.py의 스트리밍 제너레이터가 읽어서 [LOG] 이벤트로 전송
+# ==========================================
+_log_buffer = []
+_log_lock = threading.Lock()
+
+def _push_log(msg: str):
+    with _log_lock:
+        _log_buffer.append(msg)
+
+def pop_pending_logs() -> list:
+    with _log_lock:
+        logs = _log_buffer[:]
+        _log_buffer.clear()
+        return logs
+
+
+# ==========================================
 # 🧩 2. 공통 유틸리티 (지휘관님 원본 복구)
 # ==========================================
 def _invoke_with_backoff(llm, prompt, max_retries=3):
-    """Groq 413/rate_limit 에러 시 지수 백오프 재시도."""
+    """Groq 413/rate_limit 에러 시 지수 백오프 재시도. 모두 실패 시 로컬 Ollama 자동 폴백."""
+    last_err = None
     for attempt in range(max_retries):
         try:
             return llm.invoke(prompt)
         except Exception as e:
+            last_err = e
             err = str(e)
-            if ("413" in err or "rate_limit_exceeded" in err.lower()) and attempt < max_retries - 1:
+            is_rate_limit = "413" in err or "rate_limit_exceeded" in err.lower()
+            if is_rate_limit and attempt < max_retries - 1:
                 wait = 2 ** attempt  # 1초 → 2초 → 4초
                 print(f"[Rate Limit] {wait}초 대기 후 재시도 ({attempt+1}/{max_retries})...")
                 time.sleep(wait)
             else:
-                raise
+                break  # rate_limit 아닌 에러 또는 마지막 시도 → 즉시 탈출
+
+    # 모든 재시도 실패 — rate_limit이고 외부 LLM이었으면 로컬로 폴백
+    if last_err and ("rate_limit_exceeded" in str(last_err).lower() or "413" in str(last_err)):
+        if llm is not local_llm:
+            msg = "⚠️ Groq API 한도 소진 → 로컬 Ollama로 전환 (답변 품질이 낮을 수 있습니다)"
+            print(f"[Fallback] {msg}")
+            _push_log(msg)
+            return local_llm.invoke(prompt)  # 로컬도 실패하면 예외 그대로 전파
+
+    raise last_err
 
 
-def get_dynamic_harness():
+def get_dynamic_harness(persona_memo: str = ""):
     base_harness = GLOBAL_HARNESS_MD
     if os.path.exists("added_rules.txt"):
         with open("added_rules.txt", "r", encoding="utf-8") as f:
             additional_rules = f.read()
-        return base_harness + "\n[AI가 실시간으로 학습한 추가 보안 규정]\n" + additional_rules
+        base_harness = base_harness + "\n[AI가 실시간으로 학습한 추가 보안 규정]\n" + additional_rules
+
     return base_harness
+
+
+def build_persona_block(persona_memo: str) -> str:
+    """Phase 1 자유 입력형 개인화: [사용자 질문] 바로 앞에 주입해야 LLM이 마지막으로 읽고 반영함.
+    하네스 말미에 넣으면 이후 output_format 지시문에 덮어씌워지므로 반드시 이 함수를 사용할 것.
+    TODO Phase 2: 피드백(👍/👎) 누적 자동 학습 규칙도 여기에 추가 주입 예정."""
+    if not persona_memo or not persona_memo.strip():
+        return ""
+    return f"\n🔴 [사용자 개인화 지시 — 출력 형식보다 우선 적용, 절대 무시 금지]\n{persona_memo.strip()}\n"
 
 
 def format_history(history_list):
@@ -555,7 +596,6 @@ def expert_agent_node(state: AgentState):
     [사내 문서(VectorRAG)]: {search_ctx}
     [관계망 기억(GraphRAG)]: {graph_ctx}
     [외부 웹 정보]: {web_ctx}
-
     [사용자 질문]: {query}
     """
     response = _invoke_with_backoff(active_llm, prompt).content
@@ -734,6 +774,60 @@ def summary_node(state: AgentState):
 
 
 # ==========================================
+# 🧬 7-1. 개인화 에이전트 (Persona Agent)
+# ==========================================
+def persona_agent_node(state: AgentState):
+    """Phase 1 자유 입력형 개인화: 내용·구조는 그대로, 말투·표현만 변환.
+    persona_memo 가 없으면 패스스루(빈 dict 반환)로 동작해 성능 낭비 없음.
+    TODO Phase 2: 피드백 누적 자동 학습 규칙도 여기서 함께 적용 예정."""
+    persona_memo = state.get("persona_memo", "").strip()
+    if not persona_memo:
+        return {}
+
+    draft = state.get("draft_answer", "")
+    if not draft:
+        return {}
+
+    fallback_mode = state.get("fallback_mode", False)
+    # 표 구조 보존 정확도가 중요 → 70B 사용 (8B는 테이블 셀을 날려버리는 버그 있음)
+    active_llm = local_llm if fallback_mode else expert_llm
+
+    # 테이블 행(| 로 시작)을 미리 추출해두고 LLM에게 넘기지 않음 → 변환 후 원본 복원
+    lines = draft.split('\n')
+    table_lines = {i: line for i, line in enumerate(lines) if line.strip().startswith('|')}
+    prose_only = '\n'.join('' if i in table_lines else line for i, line in enumerate(lines))
+
+    print(f"🧬 [개인화 에이전트] 스타일 변환 적용 중... (테이블 {len(table_lines)}행 보호)")
+
+    prompt = f"""아래 [원본 텍스트]의 내용과 마크다운 구조(###, **, -, > 등)는 절대 변경하지 마세요.
+오직 [사용자 스타일 지시]에 따라 말투와 표현 방식만 바꾸세요.
+정보 추가·삭제·요약 금지. 빈 줄은 그대로 유지하세요.
+서론("변환된 답변:" 등) 없이 바로 본문만 출력하세요.
+
+[사용자 스타일 지시]
+{persona_memo}
+
+[원본 텍스트]
+{prose_only}"""
+
+    try:
+        result = _invoke_with_backoff(active_llm, prompt).content.strip()
+
+        # 변환된 텍스트에 원본 테이블 행 복원
+        result_lines = result.split('\n')
+        for idx, original_table_line in table_lines.items():
+            if idx < len(result_lines):
+                result_lines[idx] = original_table_line
+            else:
+                result_lines.append(original_table_line)
+
+        return {"draft_answer": '\n'.join(result_lines)}
+    except Exception as e:
+        print(f"[개인화 에이전트 실패] {e} — 원본 유지")
+        return {}
+
+
+# ==========================================
 # ⚖️ 7. 검수 (Critic) 및 수정
 # ==========================================
 def critic_node(state: AgentState):
@@ -803,7 +897,7 @@ def revision_agent_node(state: AgentState):
 - JSON, 대시보드 데이터는 포함하지 마세요. (시스템이 자동 처리)
 - 서론("수정된 답변:", "아래와 같이" 등) 없이 수정된 본문만 출력하세요."""
 
-    response = active_llm.invoke(prompt).content
+    response = _invoke_with_backoff(active_llm, prompt).content
     return {"draft_answer": response}
 
 
@@ -838,23 +932,50 @@ def custom_agent_gate_node(state: AgentState):
             return {}
 
         query_vec = model.encode(query, normalize_embeddings=True)
-        best_score, best_agent = 0.0, None
+        passing_agents = []
         for agent in agents_list:
             desc = agent.get("description", "")
             if not desc:
                 continue
             desc_vec = model.encode(desc, normalize_embeddings=True)
             score = float(np.dot(query_vec, desc_vec))
-            if score > best_score:
-                best_score, best_agent = score, agent
+            agent_threshold = agent.get("threshold", _CUSTOM_AGENT_AUTO_THRESHOLD)
+            if score >= agent_threshold:
+                passing_agents.append((score, agent))
 
-        if best_agent and best_score >= _CUSTOM_AGENT_AUTO_THRESHOLD:
-            agent_name = best_agent["name"]
-            agent_prompt = best_agent["description"]
-            print(f"🎭 [커스텀 에이전트 자동 선택] '{agent_name}' (유사도: {best_score:.2f})")
-        else:
-            print(f"🎭 [커스텀 에이전트] 매칭 없음 (최고 유사도: {best_score:.2f}) — 스킵")
+        if not passing_agents:
+            print(f"🎭 [커스텀 에이전트] threshold를 넘은 에이전트 없음 — 스킵")
             return {}
+
+        # 점수 내림차순 정렬
+        passing_agents.sort(key=lambda x: x[0], reverse=True)
+
+        # ── 다중 매칭: 각 에이전트 독립 실행 → 별도 버블로 스트리밍 ──
+        if len(passing_agents) > 1:
+            print(f"🎭 [커스텀 에이전트 다중 매칭] {len(passing_agents)}개 활성화")
+            multi_responses = []
+            for score, agent in passing_agents:
+                a_name = agent["name"]
+                a_prompt_text = agent["description"]
+                print(f"  → '{a_name}' (유사도: {score:.2f}, 임계값: {agent.get('threshold', _CUSTOM_AGENT_AUTO_THRESHOLD):.2f})")
+                prompt = CUSTOM_AGENT_PROMPT.format(
+                    agent_name=a_name,
+                    agent_prompt=a_prompt_text,
+                    history_str=history_str,
+                    query=query,
+                )
+                try:
+                    response = _invoke_with_backoff(active_llm, prompt).content.strip()
+                    multi_responses.append({"name": a_name, "response": response})
+                except Exception as e:
+                    print(f"  ⚠️ '{a_name}' 실패 (무시): {e}")
+            return {"multi_agent_responses": multi_responses}
+
+        # ── 단일 매칭: 기존 동작 ──
+        best_score, best_agent = passing_agents[0]
+        agent_name = best_agent["name"]
+        agent_prompt = best_agent["description"]
+        print(f"🎭 [커스텀 에이전트 자동 선택] '{agent_name}' (유사도: {best_score:.2f})")
 
     print(f"🎭 [커스텀 에이전트: {agent_name}] 관점 추가 중...")
     prompt = CUSTOM_AGENT_PROMPT.format(

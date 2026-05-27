@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -22,6 +22,7 @@ import uuid
 from pydantic import BaseModel
 from typing import Optional
 from ai_core.router import langgraph_app
+from ai_core.nodes import pop_pending_logs
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -60,6 +61,9 @@ class ChatRequest(BaseModel):
     target_agent_prompt: Optional[str] = None  # 커스텀 에이전트 성격/역할 (수동 선택)
     custom_agents_list: Optional[list] = []    # 자동 매칭용 전체 커스텀 에이전트 목록
     existing_dashboard: Optional[dict] = None
+    # Phase 1 자유 입력형 개인화: 마이페이지에서 설정한 자연어 지시문
+    # TODO Phase 2: 피드백(👍/👎) 누적 → 자동 학습된 개인화 규칙으로 대체 예정
+    persona_memo: Optional[str] = ""
 
 
 load_dotenv()
@@ -71,6 +75,9 @@ print("모델 로딩 완료!", flush=True)
 security = HTTPBearer()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM")
+
+if not JWT_SECRET_KEY or not JWT_ALGORITHM:
+    raise RuntimeError("JWT_SECRET_KEY, JWT_ALGORITHM 환경변수가 설정되지 않았습니다. .env 파일을 확인하세요.")
 
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -115,10 +122,6 @@ async def chat_with_ai(
 ):
     user_id = token_payload.get("user_id")
     workspace_id = token_payload.get("workspace_id")
-    print(f"\n==================================================================")
-    print(f"[채팅 요청] 유저: {user_id} | 워크스페이스: {workspace_id}")
-    print(f"\n==================================================================")
-
     start_time = time.time()
 
     inputs = {
@@ -161,10 +164,11 @@ def _clean_final_answer(text: str) -> str:
     text = re.sub(r'\[이전 대화[^\]]*\][^\n]*\n?', '', text)
     text = re.sub(r'\[전 요원[^\]]*\][^\n]*\n?', '', text)
     text = re.sub(r'\[출력 구조[^\]]*\][^\n]*\n?', '', text)
-    text = re.sub(r'^⚠️[^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\u26a0\ufe0f[^\n]*\n?', '', text, flags=re.MULTILINE)
     text = re.sub(r'\n{3,}', '\n\n', text)
+    # llama 모델이 표 셀에 중국어(CJK)를 출력하는 버그 후처리 — 한국어 전용 서비스이므로 제거
+    text = re.sub(r'[一-鿿㐀-䶿豈-﫿]+', '', text)
     return text.strip()
-
 
 async def _stream_answer(text: str):
     """코드 블록은 통째로, 일반 텍스트는 단어 단위로 스트리밍."""
@@ -230,12 +234,7 @@ async def chat_with_ai_stream(
     workspace_id = body.workspace_id or token_payload.get("workspace_id")
     bearer_token = request.headers.get("Authorization", "").replace("Bearer ", "")
 
-    print(f"\n==================================================================")
-    print(f"[스트리밍 요청] 유저: {user_id} | 워크스페이스: {workspace_id}", flush=True)
-    print(f"\n==================================================================")
-
     async def event_generator():
-        print("★ [진입 성공] 프론트엔드 요청이 FastAPI에 도달했습니다!", flush=True)
         start_time = time.time()
         inputs = {
             "query": body.query,
@@ -247,6 +246,7 @@ async def chat_with_ai_stream(
             "custom_agent_prompt": body.target_agent_prompt or "",
             "custom_agents_list": body.custom_agents_list or [],
             "existing_dashboard": body.existing_dashboard or {},
+            "persona_memo": body.persona_memo or "",
         }
 
         node_kor_name = {
@@ -266,9 +266,11 @@ async def chat_with_ai_stream(
             "critic":               "품질 검수 요원",
             "revision_agent":       "재작성 요원",
             "custom_agent_gate":    "커스텀 에이전트",
+            "persona_agent":        "개인화 적용 중",
         }
 
         queue = asyncio.Queue()
+        current_multi_agent_responses = []
 
         async def run_langgraph():
             try:
@@ -322,7 +324,12 @@ async def chat_with_ai_stream(
 
                             agent_name = node_kor_name.get(node_name, node_name)
 
-                            if node_name == "clarify" and is_dict and output.get("need_clarification"):
+                            if node_name == "supervisor" and is_dict:
+                                target = output.get("target_agent_name", "")
+                                if target in ("general_agent", "expert_agent", "coding_math_agent"):
+                                    yield f"data: [ROUTE]{target}\n\n"
+                                yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
+                            elif node_name == "clarify" and is_dict and output.get("need_clarification"):
                                 # 역질문 이벤트 즉시 전송
                                 import json as _json
                                 payload = {
@@ -340,14 +347,22 @@ async def chat_with_ai_stream(
                                     safe_feedback = str(critic_result or "").replace('\n', ' ')
                                     yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려 및 재작성 지시: {safe_feedback}\n\n"
                             elif node_name == "custom_agent_gate" and is_dict:
+                                multi = output.get("multi_agent_responses", [])
+                                if multi:
+                                    current_multi_agent_responses.extend(multi)
+                                    names = ", ".join(a["name"] for a in multi)
+                                    yield f"data: [LOG]🎭 다중 에이전트 활성화: {names}\n\n"
                                 matched = output.get("matched_custom_agent_name", "")
                                 if matched:
                                     yield f"data: [LOG]🎭 [{matched}] 관점 추가 완료.\n\n"
-                                # 매칭 없이 스킵된 경우 로그 생략
                             else:
                                 yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
 
                             await asyncio.sleep(0.01)
+
+                            # 폴백 발생 시 SSE 로그 방출
+                            for pending_log in pop_pending_logs():
+                                yield f"data: [LOG]{pending_log}\n\n"
 
                             # 💡 여기도 안전 검증을 수행합니다.
                             critic_result = output.get("critic_feedback") if is_dict else None
@@ -361,6 +376,15 @@ async def chat_with_ai_stream(
                                 answer_to_stream = _clean_final_answer(current_final_answer)
                                 async for chunk in _stream_answer(answer_to_stream):
                                     yield chunk
+                                # 다중 에이전트 응답 — 각각 별도 버블로 순차 스트리밍
+                                for agent_resp in current_multi_agent_responses:
+                                    await asyncio.sleep(0.1)
+                                    yield f"data: [AGENT_START:{agent_resp['name']}]\n\n"
+                                    await asyncio.sleep(0.05)
+                                    async for chunk in _stream_answer(_clean_final_answer(agent_resp["response"])):
+                                        yield chunk
+                                    yield f"data: [AGENT_END]\n\n"
+                                    await asyncio.sleep(0.05)
                             elif node_name == "greeting" and is_dict and "final_answer" in output:
                                 answer_to_stream = _clean_final_answer(current_final_answer)
                                 async for chunk in _stream_answer(answer_to_stream):
@@ -379,18 +403,7 @@ async def chat_with_ai_stream(
         await asyncio.sleep(0.05)
         yield f"data: [LOG]모든 에이전트 응답 완료.\n\n"
 
-        if current_final_answer and body.session_id:
-            asyncio.create_task(save_message_to_backend(
-                session_id=body.session_id,
-                user_id=user_id,
-                sender_type="LOCAL_AI",
-                sender_name="Dati",
-                content=current_final_answer,
-                is_private=False,
-                latency=latency,
-                tokens=estimated_tokens,
-                bearer_token=bearer_token,
-            ))
+        # 메시지 저장은 프론트엔드(useChatSession.js)에서 단일 처리 — 여기서 중복 저장하면 재로그인 시 답변 2개 발생
 
         yield "data: [DONE]\n\n"
 
@@ -425,7 +438,6 @@ async def upload_document(
 
 def process_and_store_document(file_path: str, filename: str, workspace_id: str, document_id: str, bearer_token: str = ""):
     try:
-        print(f"[백그라운드] '{filename}' 파일 AI 뇌 각인 시작...")
         if filename.endswith(".pdf"):
             loader = PyPDFLoader(file_path)
             documents = loader.load()
@@ -462,13 +474,11 @@ def process_and_store_document(file_path: str, filename: str, workspace_id: str,
             documents=documents_text
         )
 
-        print(f"[백그라운드] '{filename}' 분석 완료! 스프링(지휘소)으로 무전을 칩니다!")
-        webhook_url = "http://127.0.0.1:8080/api/v1/documents/webhook"
-        _send_webhook(webhook_url, document_id, "DONE", bearer_token)
+        _send_webhook(f"{SPRING_BASE_URL}/api/v1/documents/webhook", document_id, "DONE", bearer_token)
 
     except Exception as e:
         print(f"[백그라운드] 에러 발생: {e}")
-        _send_webhook("http://127.0.0.1:8080/api/v1/documents/webhook", document_id, "FAILED", bearer_token)
+        _send_webhook(f"{SPRING_BASE_URL}/api/v1/documents/webhook", document_id, "FAILED", bearer_token)
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)

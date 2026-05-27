@@ -14,7 +14,7 @@ def get_user_persona(user_id: str) -> dict:
         conn = psycopg2.connect(
             dbname=os.getenv("DB_NAME", "dativus_db"),
             user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD", "1234"),
+            password=os.getenv("DB_PASSWORD"),
             host=os.getenv("DB_HOST", "localhost"),
             port=os.getenv("DB_PORT", "5432")
         )
