@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from ai_core.state import AgentState
 from ai_core.prompts import *
+from ai_core import metrics as _metrics
 from database.chroma_manager import collection
 from database.postgres import get_user_persona
 from langchain_ollama import ChatOllama
@@ -81,7 +82,9 @@ def _invoke_with_backoff(llm, prompt, max_retries=3):
     last_err = None
     for attempt in range(max_retries):
         try:
-            return llm.invoke(prompt)
+            result = llm.invoke(prompt)
+            _metrics.record_llm_call()
+            return result
         except Exception as e:
             last_err = e
             err = str(e)
@@ -93,12 +96,20 @@ def _invoke_with_backoff(llm, prompt, max_retries=3):
             else:
                 break  # rate_limit 아닌 에러 또는 마지막 시도 → 즉시 탈출
 
-    # 모든 재시도 실패 — rate_limit이고 외부 LLM이었으면 로컬로 폴백
-    if last_err and ("rate_limit_exceeded" in str(last_err).lower() or "413" in str(last_err)):
+    # 모든 재시도 실패 — rate_limit 또는 connection 에러이고 외부 LLM이었으면 로컬로 폴백
+    _err_str = str(last_err).lower()
+    _is_fallback_target = (
+        "rate_limit_exceeded" in _err_str
+        or "413" in str(last_err)
+        or "connection error" in _err_str   # SSL/네트워크 단절 포함
+        or "connecterror" in _err_str
+    )
+    if last_err and _is_fallback_target:
         if llm is not local_llm:
             msg = "⚠️ Groq API 한도 소진 → 로컬 Ollama로 전환 (답변 품질이 낮을 수 있습니다)"
             print(f"[Fallback] {msg}")
             _push_log(msg)
+            _metrics.record_llm_call(is_fallback=True)
             return local_llm.invoke(prompt)  # 로컬도 실패하면 예외 그대로 전파
 
     raise last_err
@@ -210,7 +221,10 @@ JSON 출력:
 - 3~4개만 생성
 """
     try:
-        result = json.loads(_invoke_with_backoff(json_llm, prompt).content)
+        raw = _invoke_with_backoff(json_llm, prompt).content
+        # 중첩 없는 단일 JSON 객체만 추출 (greedy 방지)
+        m = re.search(r'\{[^{}]*\}', raw)
+        result = json.loads(m.group(0)) if m else {}
         return result if result.get("needed") else None
     except Exception as e:
         print(f"[Clarification] 모호성 판단 실패: {e}")

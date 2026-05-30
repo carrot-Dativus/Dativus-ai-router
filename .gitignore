@@ -209,3 +209,6 @@ __marimo__/
 # Dativus Vector DB
 .idea/
 chroma_storage/
+
+# 임시 디버그/테스트 파일
+test_clarify.py
