@@ -48,7 +48,7 @@ class DashboardResponse(BaseModel):
 # 🛠️ 1. 무기 및 엔진 초기화
 # ==========================================
 model = SentenceTransformer('BAAI/bge-m3')
-local_llm = ChatOllama(model="llama3", temperature=0, num_predict=1500)
+local_llm = ChatOllama(model="qwen2.5:14b", temperature=0, num_predict=1500)
 # 라우팅 · Critic · 역질문 · 대시보드 — 속도 우선
 external_llm = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.1-8b-instant", max_tokens=1500)
 # 전문 분석 — 품질 우선 (70B)
@@ -125,13 +125,50 @@ def get_dynamic_harness(persona_memo: str = ""):
     return base_harness
 
 
-def build_persona_block(persona_memo: str) -> str:
-    """Phase 1 자유 입력형 개인화: [사용자 질문] 바로 앞에 주입해야 LLM이 마지막으로 읽고 반영함.
-    하네스 말미에 넣으면 이후 output_format 지시문에 덮어씌워지므로 반드시 이 함수를 사용할 것.
-    TODO Phase 2: 피드백(👍/👎) 누적 자동 학습 규칙도 여기에 추가 주입 예정."""
-    if not persona_memo or not persona_memo.strip():
+_TONE_DESC = {
+    "친절한":           "친근하고 따뜻한 어조로 작성하세요.",
+    "단호하고 전문적인": "감정 없이 간결하고 단호한 전문가 어조로 작성하세요. '~입니다', '~해야 합니다' 위주로.",
+    "사극 이순신 장군":  "조선 시대 사극 말투로 작성하세요. '하옵니다', '소장', '그대', '~이오', '~하소서' 등 고어체를 반드시 사용하세요.",
+}
+_EXPERTISE_DESC = {
+    "기본":         "일반적인 수준으로 설명하세요.",
+    "프론트엔드":   "독자가 프론트엔드 개발자이므로 React/Vue/CSS 등 UI 관점 예시를 사용하고 기초 설명은 생략하세요.",
+    "백엔드":       "독자가 백엔드 개발자이므로 서버/DB/API 관점 예시를 사용하고 기초 설명은 생략하세요.",
+    "데이터 엔지니어": "독자가 데이터 엔지니어이므로 파이프라인/SQL/분산처리 관점 예시를 사용하세요.",
+}
+_DECISION_DESC = {
+    "일반적인": "",
+    "간단하게": "SIMPLE",  # 특수 처리: A/B/C 구조 제거, 요약+핵심답변+넥스트 스텝만
+    "창의적인": "",        # v2 예정 — 현재는 기본 동작
+}
+
+
+def build_persona_style_block(state: "AgentState") -> str:
+    """마이페이지 개인화 설정을 에이전트 프롬프트용 스타일 참고 블록으로 변환.
+    history처럼 '이렇게 써줘' 힌트로만 작동하며, A/B/C 구조 등 제품 설계는 건드리지 않음."""
+    expertise = (state.get("persona_expertise") or "기본").strip()
+    tone = (state.get("persona_tone") or "친절한").strip()
+    decision_style = (state.get("persona_decision_style") or "일반적인").strip()
+    memo = (state.get("persona_memo") or "").strip()
+
+    # 톤은 persona_agent_node에서 전담 — 여기선 구조에 영향 없는 힌트만 주입
+    lines = []
+    expertise_desc = _EXPERTISE_DESC.get(expertise, "")
+    if expertise != "기본" and expertise_desc:
+        lines.append(f"- 설명 깊이: {expertise_desc}")
+
+    # "간단하게"는 구조 자체를 바꾸므로 persona_agent_node가 처리, 여기선 주입 안 함
+    is_simple = decision_style == "간단하게"
+
+    if not lines and not is_simple:
         return ""
-    return f"\n🔴 [사용자 개인화 지시 — 출력 형식보다 우선 적용, 절대 무시 금지]\n{persona_memo.strip()}\n"
+
+    block = "\n".join(lines) if lines else ""
+    guardrail = "" if is_simple else "A/B/C 구조·요약·넥스트 스텝은 절대 제거 금지 — "
+    return (
+        f"\n[사용자 스타일 설정 — {guardrail}스타일 힌트만 반영]\n"
+        f"{block}\n" if block else f"\n[사용자 스타일 설정]\n"
+    )
 
 
 def format_history(history_list):
@@ -153,6 +190,8 @@ def format_history(history_list):
             content = re.sub(r'\[사용자 질문[^\]]*\][^\n]*', '', content)
             content = re.sub(r'\[이전 대화[^\]]*\][^\n]*', '', content)
             content = re.sub(r'\[전 요원[^\]]*\][^\n]*', '', content)
+            content = re.sub(r'\[스타일 참고[^\]]*\][\s\S]*?(?=\n\[|\Z)', '', content)
+            content = re.sub(r'^※[^\n]*', '', content, flags=re.MULTILINE)
         content = content.strip()[:limit]
         formatted += f"{role}: {content}\n"
     return formatted + "\n"
@@ -370,6 +409,9 @@ def supervisor_node(state):
     # --- 0단계: 사용자가 수동으로 부서를 선택한 경우 → supervisor 스킵 ---
     _VALID_AGENTS = {"general_agent", "expert_agent", "coding_math_agent"}
     force = state.get("force_agent", "")
+    if force == "local_test":
+        print(f"[Supervisor] 로컬 테스트 모드 → general_agent (Groq 없이 qwen2.5:14b 전담)")
+        return {"target_agent_name": "general_agent", "fallback_mode": True}
     if force in _VALID_AGENTS:
         print(f"[Supervisor] 수동 선택 감지 → {force} 직행")
         return {"target_agent_name": force, "fallback_mode": False}
@@ -588,6 +630,7 @@ def expert_agent_node(state: AgentState):
     search_ctx = (state.get("search_context", "") or "")[:500]
     web_ctx = (state.get("web_context", "") or "")[:300]
     graph_ctx = (state.get("graph_context", "") or "")[:300]
+    persona_block = build_persona_style_block(state)
 
     print("👔 [전문 대화병] 수집된 입체적 기억(Graph + Vector + Web)을 융합 추론합니다.")
 
@@ -600,6 +643,7 @@ def expert_agent_node(state: AgentState):
             clarify_hint = f"\n[역질문 선택 결과 - 반드시 이 주제를 중심으로 답변]: {', '.join(tags)}\n"
 
     prompt = f"""[전 요원 필독 하네스 룰]\n{get_dynamic_harness()}\n
+    {persona_block}
     {EXPERT_OUTPUT_FORMAT}
     당신은 최고 전문가(Logic Worker) 요원입니다.
     수집된 아래의 정보를 바탕으로 맥락을 연결(Reasoning)하여 완벽한 답변을 작성하세요.
@@ -622,6 +666,7 @@ def general_agent_node(state: AgentState):
     history_str = format_history(history_list)
     fallback_mode = state.get("fallback_mode", False)
     active_llm = local_llm if fallback_mode else external_llm
+    persona_block = build_persona_style_block(state)
 
     print(f"🗣️ [일반 대화병] 히스토리 수신: {len(history_list)}개 메시지")
 
@@ -637,6 +682,7 @@ def general_agent_node(state: AgentState):
     ) if is_memory_query and history_str else ""
 
     prompt = f"""[전 요원 필독 하네스 룰]\n{get_dynamic_harness()}\n
+    {persona_block}
     {GENERAL_OUTPUT_FORMAT}
     당신은 친절한 대화 요원입니다.
     절대 '[이전 대화 맥락]', '[사용자 질문]', '참고할 이전 대화' 같은 내부 섹션 헤더를 답변에 포함하지 마세요.
@@ -654,6 +700,7 @@ def coding_math_agent_node(state: AgentState):
     fallback_mode = state.get("fallback_mode", False)
     active_llm = local_llm if fallback_mode else coding_llm
     search_ctx = (state.get("search_context", "") or "")[:400]
+    persona_block = build_persona_style_block(state)
 
     clarify_hint = ""
     if '[추가 정보:' in query:
@@ -664,6 +711,7 @@ def coding_math_agent_node(state: AgentState):
     print("💻 [코딩/수학 대화병] 알고리즘 분석 및 수학 연산을 수행합니다.")
 
     prompt = f"""[전 요원 필독 하네스 룰]\n{get_dynamic_harness()}\n
+    {persona_block}
     {CODING_OUTPUT_FORMAT}
     당신은 시니어 개발자 수준의 프로그래밍 및 수학 전문가입니다.
     ⚠️ 반드시 [사용자 질문]에만 답하세요. 이전 대화는 맥락 참고용이며, 이전 대화 내용을 그대로 반복하거나 재생성하지 마세요.
@@ -791,53 +839,94 @@ def summary_node(state: AgentState):
 # 🧬 7-1. 개인화 에이전트 (Persona Agent)
 # ==========================================
 def persona_agent_node(state: AgentState):
-    """Phase 1 자유 입력형 개인화: 내용·구조는 그대로, 말투·표현만 변환.
-    persona_memo 가 없으면 패스스루(빈 dict 반환)로 동작해 성능 낭비 없음.
-    TODO Phase 2: 피드백 누적 자동 학습 규칙도 여기서 함께 적용 예정."""
-    persona_memo = state.get("persona_memo", "").strip()
-    if not persona_memo:
+    """톤/말투 전담 변환 노드. 내용·구조는 절대 건드리지 않고 표현 방식만 바꿈.
+    tone이 기본값('친절한')이고 memo도 없으면 passthrough."""
+    # 폴백 모드: qwen2.5:14b도 하네스 포함 긴 프롬프트에서 신뢰도 낮음 → 원본 그대로 통과
+    if state.get("fallback_mode", False):
+        print("⚠️ [Persona] 폴백 모드 — 톤 변환 생략, 원본 그대로 통과")
+        return {}
+
+    tone = (state.get("persona_tone") or "친절한").strip()
+    memo = (state.get("persona_memo") or "").strip()
+    decision_style = (state.get("persona_decision_style") or "일반적인").strip()
+    is_simple = decision_style == "간단하게"
+
+    # 변환할 내용 없으면 즉시 패스스루
+    if tone == "친절한" and not memo and not is_simple:
         return {}
 
     draft = state.get("draft_answer", "")
     if not draft:
         return {}
 
+    tone_desc = _TONE_DESC.get(tone, f"'{tone}' 스타일로 작성하세요.")
+    style_lines = [f"- 말투: {tone_desc}"]
+    if memo:
+        style_lines.append(f"- 추가 지시: {memo}")
+    style_block = "\n".join(style_lines)
+
     fallback_mode = state.get("fallback_mode", False)
-    # 표 구조 보존 정확도가 중요 → 70B 사용 (8B는 테이블 셀을 날려버리는 버그 있음)
     active_llm = local_llm if fallback_mode else expert_llm
 
-    # 테이블 행(| 로 시작)을 미리 추출해두고 LLM에게 넘기지 않음 → 변환 후 원본 복원
+    # 테이블(|)과 블록쿼트(>) 행 보호 — LLM 재작성 중 구조 날아가는 것 방지
     lines = draft.split('\n')
-    table_lines = {i: line for i, line in enumerate(lines) if line.strip().startswith('|')}
-    prose_only = '\n'.join('' if i in table_lines else line for i, line in enumerate(lines))
+    protected = {
+        i: line for i, line in enumerate(lines)
+        if line.strip().startswith('|') or line.strip().startswith('>')
+    }
+    prose_only = '\n'.join('' if i in protected else line for i, line in enumerate(lines))
 
-    print(f"🧬 [개인화 에이전트] 스타일 변환 적용 중... (테이블 {len(table_lines)}행 보호)")
+    print(f"🎭 [개인화 노드] 톤 변환 중... ('{tone}', 보호 {len(protected)}행)")
 
-    prompt = f"""아래 [원본 텍스트]의 내용과 마크다운 구조(###, **, -, > 등)는 절대 변경하지 마세요.
-오직 [사용자 스타일 지시]에 따라 말투와 표현 방식만 바꾸세요.
-정보 추가·삭제·요약 금지. 빈 줄은 그대로 유지하세요.
-서론("변환된 답변:" 등) 없이 바로 본문만 출력하세요.
+    if is_simple:
+        prompt = f"""아래 [원본 텍스트]를 간결하게 재구성하세요.
 
-[사용자 스타일 지시]
-{persona_memo}
+[출력 형식 — 반드시 이 3단계만]
+1. 한 줄 요약 (> **요약:** 으로 시작)
+2. 핵심 답변 (A/B/C 구조 없이 2~4문장으로 직접 답변)
+3. 넥스트 스텝 (> 마음에 드는 방안을 고르시면 세부 실행 계획을 설계해 드릴까요?)
+
+[절대 금지]
+- A안/B안/C안 구조 사용 금지
+- 장점/단점 불릿 나열 금지
+- 표(|) 사용 금지
+- 서론 없이 바로 본문만 출력
+
+{f"[말투]{chr(10)}{style_block}" if style_block.strip() else ""}
+
+[원본 텍스트]
+{draft}"""
+    else:
+        prompt = f"""아래 [원본 텍스트]의 각 문장을 [스타일 지시]에 맞게 자연스럽게 다시 써주세요.
+
+[절대 금지]
+- 내용·정보 추가 금지 — 원본에 없는 문장, 설명, 예시를 절대 만들지 말 것
+- 원본보다 길어지는 것 금지 — 각 문장은 원본과 비슷한 길이를 유지할 것
+- 문장 끝에 ", 하옵니다" 등 경어를 단순히 덧붙이는 것 금지
+- 잘못된 예: "유지보수가 용이합니다, 하옵니다"
+- 올바른 예: "유지보수가 용이하옵니다" (문장 자체를 재작성)
+
+[지켜야 할 것]
+- ###, A안/B안/C안, **장점:**, **단점:** 등 마크다운 헤더와 구조는 그대로 유지
+- 서론 없이 바로 본문만 출력
+
+[스타일 지시]
+{style_block}
 
 [원본 텍스트]
 {prose_only}"""
 
     try:
         result = _invoke_with_backoff(active_llm, prompt).content.strip()
-
-        # 변환된 텍스트에 원본 테이블 행 복원
         result_lines = result.split('\n')
-        for idx, original_table_line in table_lines.items():
+        for idx, original_line in protected.items():
             if idx < len(result_lines):
-                result_lines[idx] = original_table_line
+                result_lines[idx] = original_line
             else:
-                result_lines.append(original_table_line)
-
+                result_lines.append(original_line)
         return {"draft_answer": '\n'.join(result_lines)}
     except Exception as e:
-        print(f"[개인화 에이전트 실패] {e} — 원본 유지")
+        print(f"[개인화 노드 실패] {e} — 원본 유지")
         return {}
 
 
@@ -847,6 +936,27 @@ def persona_agent_node(state: AgentState):
 def critic_node(state: AgentState):
     draft_answer = state.get("draft_answer", "")
     count = state.get("revision_count", 0)
+
+    # 폴백 모드: 하네스 없는 단순 프롬프트로 qwen 검수
+    if state.get("fallback_mode", False):
+        print("⚠️ [Critic] 폴백 모드 — qwen 간이 검수 실행")
+        simple_prompt = (
+            f"아래 [답변]이 [질문]에 제대로 답하고 있으면 PASS, 핵심 내용이 빠졌거나 엉뚱하면 FAIL만 출력하세요.\n\n"
+            f"[질문]: {state.get('query', '')}\n"
+            f"[답변]: {draft_answer[:600]}\n\n"
+            f"출력 (PASS 또는 FAIL만):"
+        )
+        try:
+            decision = local_llm.invoke(simple_prompt).content.strip().upper()
+            if "PASS" in decision:
+                print("✅ [Critic] qwen 간이 검수 통과!")
+                return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+            else:
+                print(f"❌ [Critic] qwen 간이 검수 반려: {decision}")
+                return {"critic_feedback": "FAIL: 답변이 질문을 충분히 다루지 못했습니다.", "revision_count": count + 1}
+        except Exception as e:
+            print(f"⚠️ [Critic] qwen 간이 검수 실패 → 자동 PASS: {e}")
+            return {"final_answer": draft_answer, "critic_feedback": "PASS"}
 
     if count >= 1:
         print("🚨 [Critic] 수정 한도 도달. 시스템 과부하 방지를 위해 강제 PASS!")

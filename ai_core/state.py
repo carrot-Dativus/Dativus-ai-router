@@ -57,10 +57,13 @@ class AgentState(TypedDict):
     multi_agent_responses: list     # 다중 매칭 시 각 에이전트 응답 [{name, response}, ...]
 
     # ==========================================
-    # 🧬 8. 사용자 개인화 (Personalization) — Phase 1: 자유 입력형
+    # 🧬 8. 사용자 개인화 (Personalization) — Phase 1: 구조화 + 자유 입력형
     # ==========================================
-    # Phase 1 (현재): 사용자가 직접 자연어로 AI 성향을 지시 → GLOBAL_HARNESS에 주입
+    # Phase 1 (현재): 마이페이지 드롭다운 3개 + 자유 입력 메모 → 각 에이전트 프롬프트에 스타일 참고로 주입
     # TODO Phase 2: 피드백(👍/👎) 누적 데이터 자동 분석 → 개인화 패턴을 학습하여
     #   사용자별 맞춤 대시보드로 시각화 (자동학습형 개인화, 별도 백그라운드 파이프라인 필요)
-    persona_memo: str  # 사용자가 마이페이지에서 입력한 자유 형식 AI 지시문
+    persona_expertise: str       # 전문 분야: "기본", "프론트엔드", "백엔드", "데이터 엔지니어"
+    persona_tone: str            # 대화 어조: "친절한", "단호하고 전문적인", "사극 이순신 장군"
+    persona_decision_style: str  # 판단 스타일: "일반적인", "논리적인", "직관적인"
+    persona_memo: str            # 추가 자유 입력 지시문 (구조 변경 불가 주의 안내 포함)
 

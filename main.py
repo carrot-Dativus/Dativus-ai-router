@@ -61,9 +61,11 @@ class ChatRequest(BaseModel):
     target_agent_prompt: Optional[str] = None  # 커스텀 에이전트 성격/역할 (수동 선택)
     custom_agents_list: Optional[list] = []    # 자동 매칭용 전체 커스텀 에이전트 목록
     existing_dashboard: Optional[dict] = None
-    # Phase 1 자유 입력형 개인화: 마이페이지에서 설정한 자연어 지시문
-    # TODO Phase 2: 피드백(👍/👎) 누적 → 자동 학습된 개인화 규칙으로 대체 예정
-    persona_memo: Optional[str] = ""
+    # Phase 1 개인화: 드롭다운 3개 + 자유 입력 메모
+    persona_expertise: Optional[str] = ""       # 전문 분야
+    persona_tone: Optional[str] = ""            # 대화 어조
+    persona_decision_style: Optional[str] = ""  # 판단 스타일
+    persona_memo: Optional[str] = ""            # 추가 자유 입력 지시문
 
 
 load_dotenv()
@@ -164,6 +166,13 @@ def _clean_final_answer(text: str) -> str:
     text = re.sub(r'\[이전 대화[^\]]*\][^\n]*\n?', '', text)
     text = re.sub(r'\[전 요원[^\]]*\][^\n]*\n?', '', text)
     text = re.sub(r'\[출력 구조[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'^\[대화 요원[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\[전문가 요원[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    # 개인화 스타일 블록 헤더 누출 제거 - LLM이 프롬프트 지시문을 출력하는 경우
+    text = re.sub(r'^\[사용자 스타일 설정[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\[스타일 참고[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^※\s*A/B/C[^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^※\s*위 스타일[^\n]*\n?', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\u26a0\ufe0f[^\n]*\n?', '', text, flags=re.MULTILINE)
     text = re.sub(r'\n{3,}', '\n\n', text)
     # llama 모델이 표 셀에 중국어(CJK)를 출력하는 버그 후처리 — 한국어 전용 서비스이므로 제거
@@ -235,6 +244,23 @@ async def chat_with_ai_stream(
     bearer_token = request.headers.get("Authorization", "").replace("Bearer ", "")
 
     async def event_generator():
+        # ── 순수 LLM 모드: LangGraph 파이프라인 완전 스킵 ──
+        if body.force_agent == "pure_llm":
+            from ai_core.nodes import local_llm
+            prompt = (
+                "반드시 한국어로만 답변하세요. 영어나 다른 언어는 절대 사용하지 마세요.\n\n"
+                f"사용자 질문: {body.query}"
+            )
+            try:
+                async for chunk in local_llm.astream(prompt):
+                    text = chunk.content if hasattr(chunk, "content") else str(chunk)
+                    if text:
+                        yield f"data: {text}\n\n"
+            except Exception as e:
+                yield f"data: [LOG]오류: {str(e)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
         start_time = time.time()
         inputs = {
             "query": body.query,
@@ -246,6 +272,9 @@ async def chat_with_ai_stream(
             "custom_agent_prompt": body.target_agent_prompt or "",
             "custom_agents_list": body.custom_agents_list or [],
             "existing_dashboard": body.existing_dashboard or {},
+            "persona_expertise": body.persona_expertise or "",
+            "persona_tone": body.persona_tone or "",
+            "persona_decision_style": body.persona_decision_style or "",
             "persona_memo": body.persona_memo or "",
         }
 

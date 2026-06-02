@@ -14,6 +14,6 @@ external_llm = ChatGroq(
 # 🏠 2. 보조 엔진 (로컬 LLM - 무비용/검수 및 비상용)
 # O/X 검수(Critic)와 Groq 한도 초과 시 비상용으로 사용됩니다.
 local_llm = ChatOllama(
-    model="llama3", # Ollama에 설치되어 있는 로컬 모델명 (llama3, mistral 등)
-    temperature=0.1 # 엄격한 검수를 위해 창의성 최소화
+    model="qwen2.5:14b",
+    temperature=0.1
 )

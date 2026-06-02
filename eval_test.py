@@ -20,8 +20,8 @@ USER_ID      = "22222222-2222-2222-2222-222222222222"
 
 # eval 환경에서 Groq SSL 이슈로 Ollama를 비교 기준으로 사용
 # (파이프라인도 Ollama 폴백으로 동작 중이므로 비교 공정함)
-judge_llm  = ChatOllama(model="llama3", temperature=0, num_predict=1500)
-single_llm = ChatOllama(model="llama3", temperature=0, num_predict=2000)
+judge_llm  = ChatOllama(model="qwen2.5:14b", temperature=0, num_predict=1500)
+single_llm = ChatOllama(model="qwen2.5:14b", temperature=0, num_predict=2000)
 
 # ──────────────────────────────────────────────
 # 테스트 데이터셋
