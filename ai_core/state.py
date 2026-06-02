@@ -1,5 +1,6 @@
 from typing import TypedDict, Annotated, Sequence
 import operator
+from langgraph.graph.message import add_messages
 
 
 class AgentState(TypedDict):
@@ -32,11 +33,26 @@ class AgentState(TypedDict):
     dashboard_data: dict  # 프론트엔드 대시보드 렌더링용 JSON 데이터
 
     # ==========================================
+    # 🔍 3-1. 검색 인텔리전스 (Phase 1)
+    # ==========================================
+    query_rewritten: str   # 검색 최적화된 쿼리 (query_rewriter_node 출력)
+    sub_queries: list      # 멀티홉 분해 서브쿼리 ["서브1", "서브2", ...]
+    search_plan: list      # 활성화할 검색 레인 ["vector", "web", "graph"]
+    search_attempts: int   # 재검색 시도 횟수 (루프 가드, 최대 2)
+    search_grade: str      # "sufficient" | "rewrite"
+    tool_calls_history: list  # ReAct 도구 호출 이력 [{tool, args}, ...]
+
+    # ==========================================
+    # 🤖 3-2. ReAct 메시지 (expert_agent 전용)
+    # ==========================================
+    messages: Annotated[list, add_messages]  # bind_tools 루프용 메시지 누적
+
+    # ==========================================
     # ⚖️ 5. 검수(Critic) 및 무한 루프 제어
     # ==========================================
     draft_answer: str  # 부서에서 작성한 최초 답변 초안
-    critic_feedback: str  # 로컬 LLM(Critic)이 남긴 지적/반려 사유
-    revision_count: int  # 무한 루프 방지용 카운터 (1회 제한)
+    critic_feedback: str  # Critic JSON 피드백 {"pass": bool, "reasons": [], "fix_targets": []}
+    revision_count: int  # 무한 루프 방지용 카운터 (2회 제한)
     final_answer: str  # 프론트엔드로 쏠 최종 통과 답변
 
     # ==========================================
@@ -52,6 +68,7 @@ class AgentState(TypedDict):
     # ==========================================
     custom_agent_name: str          # 수동 선택된 에이전트 이름
     custom_agent_prompt: str        # 수동 선택된 에이전트 성격/역할
+    custom_agent_type: str          # 수동 선택된 에이전트 엔진 (LOCAL / EXTERNAL_API)
     custom_agents_list: list        # 자동 매칭용 전체 에이전트 목록 [{name, description}, ...]
     matched_custom_agent_name: str  # 실제 호출된 에이전트 이름 (대시보드 표시용)
     multi_agent_responses: list     # 다중 매칭 시 각 에이전트 응답 [{name, response}, ...]

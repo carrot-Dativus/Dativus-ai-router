@@ -15,8 +15,12 @@ from ai_core.prompts import *
 from ai_core import metrics as _metrics
 from database.chroma_manager import collection
 from database.postgres import get_user_persona
+from database.graph_store import save_triples, load_context as graph_load_context
 from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
 from sentence_transformers import SentenceTransformer
 from langchain_community.tools import DuckDuckGoSearchResults
 
@@ -55,6 +59,52 @@ external_llm = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), m
 expert_llm   = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", max_tokens=2000)
 # 코딩/수학 · 재작성 — 정밀도 우선 (70B)
 coding_llm   = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", max_tokens=3000)
+
+
+# ==========================================
+# 🔧 ReAct 도구 정의 (expert_agent 전용)
+# ==========================================
+
+# tools에서 workspace_id를 읽기 위한 thread-local 컨텍스트
+_tool_ctx = threading.local()
+
+@tool
+def rag_search(query: str) -> str:
+    """Search the internal team knowledge base (ChromaDB) for company documents, uploaded files, or past decisions. Use when the question involves internal/company-specific information."""
+    workspace_id = getattr(_tool_ctx, "workspace_id", None)
+    try:
+        emb = model.encode(query).tolist()
+        r = collection.query(
+            query_embeddings=[emb],
+            n_results=3,
+            where={"workspace_id": workspace_id} if workspace_id else None,
+        )
+        docs = r["documents"][0] if r["documents"] else []
+        result = "\n".join(docs) if docs else "관련 문서를 찾을 수 없습니다."
+        print(f"[Tool:rag_search] '{query[:30]}' → {len(docs)}건")
+        return result
+    except Exception as e:
+        return f"검색 실패: {e}"
+
+
+@tool
+def web_search_tool(query: str) -> str:
+    """Search the web for recent, external, or up-to-date information using DuckDuckGo. Use when the question needs current data, trends, or information not available internally."""
+    try:
+        search = DuckDuckGoSearchResults(num_results=3)
+        raw = search.invoke(query)
+        snippets = re.findall(r"snippet:\s*([^,\]]+)", raw)
+        result = " ".join(s.strip() for s in snippets[:3])[:600] if snippets else raw[:500]
+        print(f"[Tool:web_search] '{query[:30]}' → {len(result)}자")
+        return result
+    except Exception as e:
+        return f"웹 검색 실패: {e}"
+
+
+_REACT_TOOLS = [rag_search, web_search_tool]
+expert_tools_node = ToolNode(_REACT_TOOLS)          # router.py에서 graph에 등록
+_expert_llm_with_tools = expert_llm.bind_tools(_REACT_TOOLS)
+_MAX_TOOL_ROUNDS = 3                                 # 도구 호출 최대 라운드 (루프 가드)
 
 
 # ==========================================
@@ -619,8 +669,304 @@ def graph_memory_node(state: AgentState):
 
 
 # ==========================================
+# 🔎 4-2. Phase 1 — 검색 인텔리전스 노드
+# ==========================================
+
+def query_rewriter_node(state: AgentState):
+    """검색 최적화 쿼리 재작성 + 레인 선택 + 멀티홉 분해."""
+    query = state["query"]
+    history_str = format_history(state.get("history", []))
+
+    prompt = QUERY_REWRITER_PROMPT.format(
+        query=query,
+        history=history_str[:300] if history_str else "없음",
+    )
+    try:
+        json_llm = external_llm.bind(response_format={"type": "json_object"})
+        raw = _invoke_with_backoff(json_llm, prompt).content
+        result = json.loads(raw)
+        rewritten = result.get("rewritten", query).strip() or query
+        lanes = result.get("search_lanes", ["vector", "web", "graph"])
+        if not isinstance(lanes, list) or not lanes:
+            lanes = ["vector", "web", "graph"]
+        # 멀티홉 서브쿼리 — 중복·빈 값 제거
+        raw_subs = result.get("sub_queries", [])
+        sub_queries = [s.strip() for s in raw_subs if s.strip() and s.strip() != rewritten][:3]
+        if sub_queries:
+            print(f"[QueryRewriter] 멀티홉 분해: {sub_queries}")
+        print(f"[QueryRewriter] '{query[:30]}' → '{rewritten[:30]}' | 레인: {lanes}")
+        return {
+            "query_rewritten": rewritten,
+            "sub_queries": sub_queries,
+            "search_plan": lanes,
+            "search_attempts": 0,
+        }
+    except Exception as e:
+        print(f"[QueryRewriter] 실패 → 원문 그대로 사용: {e}")
+        return {
+            "query_rewritten": query,
+            "sub_queries": [],
+            "search_plan": ["vector", "web", "graph"],
+            "search_attempts": 0,
+        }
+
+
+def selective_search_node(state: AgentState):
+    """search_plan에 따라 선택적 검색 실행. sub_queries가 있으면 각각 검색 후 결과 합산 (멀티홉)."""
+    plan = state.get("search_plan", ["vector", "web", "graph"])
+    main_query = state.get("query_rewritten") or state["query"]
+    sub_queries = state.get("sub_queries") or []
+    workspace_id = state.get("workspace_id")
+
+    # 실제로 검색할 쿼리 목록: main + sub (중복 제거)
+    all_queries = [main_query] + [q for q in sub_queries if q != main_query]
+    print(f"[SelectiveSearch] 레인: {plan} | 쿼리 {len(all_queries)}개 {[q[:25] for q in all_queries]}")
+
+    def _vector_one(q: str) -> str:
+        try:
+            emb = model.encode(q).tolist()
+            r = collection.query(
+                query_embeddings=[emb],
+                n_results=2,
+                where={"workspace_id": workspace_id} if workspace_id else None,
+            )
+            return "\n".join(r["documents"][0]) if r["documents"] else ""
+        except Exception as e:
+            print(f"[SelectiveSearch] vector 실패({q[:20]}): {e}")
+            return ""
+
+    def _web_one(q: str) -> str:
+        try:
+            search = DuckDuckGoSearchResults(num_results=3)
+            raw = search.invoke(q)
+            snippets = re.findall(r"snippet:\s*([^,\]]+)", raw)
+            return " ".join(s.strip() for s in snippets[:2])[:400] if snippets else raw[:350]
+        except Exception as e:
+            print(f"[SelectiveSearch] web 실패({q[:20]}): {e}")
+            return ""
+
+    def _graph() -> str:
+        history_list = state.get("history", [])
+        if not history_list:
+            return ""
+        try:
+            history_str = format_history(history_list)
+            prompt = (
+                f"대화 기록에서 질문과 관련된 핵심 개체와 관계를 추출하세요.\n"
+                f"형식: [개체A] → (관계) → [개체B]\n"
+                f"[이전 대화]: {history_str}\n[질문]: {main_query}"
+            )
+            return local_llm.invoke(prompt).content
+        except Exception as e:
+            print(f"[SelectiveSearch] graph 실패: {e}")
+            return ""
+
+    vector_parts, web_parts = [], []
+    graph_ctx = ""
+
+    with ThreadPoolExecutor(max_workers=6) as exe:
+        futures = {}
+
+        # vector: 쿼리별 병렬
+        if "vector" in plan:
+            for i, q in enumerate(all_queries):
+                futures[f"v_{i}"] = exe.submit(_vector_one, q)
+
+        # web: 쿼리별 병렬
+        if "web" in plan:
+            for i, q in enumerate(all_queries):
+                futures[f"w_{i}"] = exe.submit(_web_one, q)
+
+        # graph: main_query 1회만
+        if "graph" in plan:
+            futures["graph"] = exe.submit(_graph)
+
+        # 결과 수집
+        for i in range(len(all_queries)):
+            if f"v_{i}" in futures:
+                try:
+                    part = futures[f"v_{i}"].result(timeout=5.0)
+                    if part:
+                        vector_parts.append(f"[서브쿼리: {all_queries[i]}]\n{part}")
+                except Exception:
+                    pass
+            if f"w_{i}" in futures:
+                try:
+                    part = futures[f"w_{i}"].result(timeout=8.0)
+                    if part:
+                        web_parts.append(f"[서브쿼리: {all_queries[i]}]\n{part}")
+                except Exception:
+                    pass
+        if "graph" in futures:
+            try:
+                graph_ctx = futures["graph"].result(timeout=10.0)
+            except Exception:
+                pass
+
+    search_ctx = "\n\n".join(vector_parts)[:1000]
+    web_ctx    = "\n\n".join(web_parts)[:600]
+    return {"search_context": search_ctx, "web_context": web_ctx, "graph_context": graph_ctx}
+
+
+def search_grader_node(state: AgentState):
+    """검색 결과 품질 채점. 부족하면 query_rewritten 갱신 + search_attempts 증가."""
+    query = state.get("query_rewritten") or state["query"]
+    search_ctx = (state.get("search_context", "") or "")[:400]
+    web_ctx = (state.get("web_context", "") or "")[:200]
+    graph_ctx = (state.get("graph_context", "") or "")[:200]
+    attempts = state.get("search_attempts", 0)
+
+    # 검색 결과 자체가 없으면 sufficient(검색 불가 환경)
+    if not search_ctx and not web_ctx and not graph_ctx:
+        print("[SearchGrader] 수집 결과 없음 → sufficient 패스스루")
+        return {"search_grade": "sufficient"}
+
+    prompt = SEARCH_GRADER_PROMPT.format(
+        query=query,
+        search_ctx=search_ctx or "없음",
+        web_ctx=web_ctx or "없음",
+        graph_ctx=graph_ctx or "없음",
+    )
+    try:
+        json_llm = external_llm.bind(response_format={"type": "json_object"})
+        raw = _invoke_with_backoff(json_llm, prompt).content
+        result = json.loads(raw)
+        grade = result.get("grade", "sufficient")
+
+        if grade == "rewrite":
+            refined = result.get("refined_query", query).strip() or query
+            reason = result.get("reason", "")
+            print(f"[SearchGrader] 부족({reason}) → 재쿼리: '{refined[:40]}' (시도 {attempts+1}/2)")
+            return {
+                "search_grade": "rewrite",
+                "query_rewritten": refined,
+                "search_attempts": attempts + 1,
+            }
+        else:
+            print(f"[SearchGrader] 충분 ✓ ({attempts+1}회차)")
+            return {"search_grade": "sufficient"}
+
+    except Exception as e:
+        print(f"[SearchGrader] 실패 → sufficient 처리: {e}")
+        return {"search_grade": "sufficient"}
+
+
+def route_from_search_grader(state: AgentState):
+    grade = state.get("search_grade", "sufficient")
+    attempts = state.get("search_attempts", 0)
+    if grade == "rewrite" and attempts < 2:
+        return "selective_search"
+    return "expert_agent"
+
+
+# ==========================================
 # 👔 5. 추론 및 생성 부서 (Logic Workers) - 💡 동적 하네스 탑재!
 # ==========================================
+
+def expert_agent_react_node(state: AgentState):
+    """ReAct expert agent: bind_tools + agent→tool→agent 조건부 루프."""
+
+    # 폴백 모드: qwen은 function calling 신뢰도 낮음 → 도구 없이 기존 방식
+    if state.get("fallback_mode", False):
+        print("⚠️ [ReAct] 폴백 모드 → 도구 없이 expert_agent 실행")
+        return expert_agent_node(state)
+
+    # workspace_id를 thread-local에 저장 (tools 내부에서 사용)
+    _tool_ctx.workspace_id = state.get("workspace_id", "")
+
+    messages = list(state.get("messages") or [])
+
+    # ── 첫 진입: 초기 SystemMessage + HumanMessage 구성 ──
+    if not messages:
+        query = state.get("query_rewritten") or state["query"]
+        history_str = format_history(state.get("history", []))
+        persona_block = build_persona_style_block(state)
+
+        # 사전 수집된 검색 컨텍스트 (selective_search 결과)
+        search_ctx = (state.get("search_context", "") or "")[:500]
+        web_ctx    = (state.get("web_context",    "") or "")[:300]
+        graph_ctx  = (state.get("graph_context",  "") or "")[:200]
+        pre_ctx = ""
+        if search_ctx:
+            pre_ctx += f"\n[사전 수집 — 사내 문서]:\n{search_ctx}"
+        if web_ctx:
+            pre_ctx += f"\n[사전 수집 — 웹]:\n{web_ctx}"
+        if graph_ctx:
+            pre_ctx += f"\n[사전 수집 — 대화 맥락]:\n{graph_ctx}"
+
+        # clarify_hint
+        clarify_hint = ""
+        if "[추가 정보:" in query:
+            tags = re.findall(r"\[추가 정보:\s*([^\]]+)\]", query)
+            if tags:
+                clarify_hint = f"\n[역질문 선택 결과 — 이 주제 중심으로 답변]: {', '.join(tags)}\n"
+
+        system_content = (
+            f"{get_dynamic_harness()}\n\n"
+            f"{EXPERT_OUTPUT_FORMAT}\n"
+            f"{persona_block}\n"
+            f"당신은 최고 전문가 요원입니다.\n"
+            f"• 제공된 사전 정보가 충분하면 즉시 최종 답변을 작성하세요.\n"
+            f"• 추가 정보가 필요하면 rag_search 또는 web_search_tool을 호출하세요 (최대 {_MAX_TOOL_ROUNDS}회).\n"
+            f"• 반드시 [사용자 질문]에만 답하세요. 이전 대화는 맥락 참고용, 재생성 금지.\n"
+            f"• 사내 문서가 질문과 무관하면 완전히 무시하고 일반 지식으로 답하세요.\n"
+            f"{clarify_hint}"
+            f"{history_str}"
+            f"{pre_ctx}"
+        )
+        messages = [
+            SystemMessage(content=system_content),
+            HumanMessage(content=query),
+        ]
+
+    # ── LLM 호출 ──
+    # 이미 도구를 MAX-1회 호출했으면 마지막 호출에서 tools 제거 → 텍스트 강제
+    current_tool_rounds = sum(1 for m in messages if getattr(m, "tool_calls", None))
+    active_llm_for_react = expert_llm if current_tool_rounds >= _MAX_TOOL_ROUNDS - 1 else _expert_llm_with_tools
+    if current_tool_rounds >= _MAX_TOOL_ROUNDS - 1:
+        print(f"⚠️ [ReAct] 도구 {current_tool_rounds}회차 — 마지막 호출, 텍스트 강제")
+    else:
+        print(f"🤖 [ReAct] LLM 호출 (메시지 {len(messages)}개, 도구 {current_tool_rounds}회차)")
+    response = _invoke_with_backoff(active_llm_for_react, messages)
+
+    tool_calls = getattr(response, "tool_calls", None)
+
+    if not tool_calls:
+        # 도구 호출 없음 → 최종 답변 확정
+        print("✅ [ReAct] 최종 답변 생성 완료")
+        return {
+            "messages": [response],
+            "draft_answer": response.content,
+        }
+
+    # 도구 호출 있음 → tool_calls_history 기록 후 ToolNode로 이동
+    history = list(state.get("tool_calls_history") or [])
+    for tc in tool_calls:
+        history.append({"tool": tc["name"], "args": tc.get("args", {})})
+        print(f"🔧 [ReAct] 도구 호출 예약: {tc['name']}({tc.get('args', {})})")
+
+    return {
+        "messages": [response],
+        "tool_calls_history": history,
+    }
+
+
+def should_use_tools(state: AgentState) -> str:
+    """ReAct 분기: 마지막 메시지에 tool_calls가 있으면 'tools', 없으면 'end'."""
+    messages = state.get("messages") or []
+    if not messages:
+        return "end"
+    last = messages[-1]
+    if not getattr(last, "tool_calls", None):
+        return "end"
+    # 루프 가드: 도구 호출 라운드 횟수 제한
+    tool_rounds = sum(1 for m in messages if getattr(m, "tool_calls", None))
+    if tool_rounds >= _MAX_TOOL_ROUNDS:
+        print(f"⛔ [ReAct] 도구 {_MAX_TOOL_ROUNDS}라운드 한도 도달 → end")
+        return "end"
+    return "tools"
+
+
 def expert_agent_node(state: AgentState):
     query = state["query"]
     history_str = format_history(state.get("history", []))
@@ -937,7 +1283,7 @@ def critic_node(state: AgentState):
     draft_answer = state.get("draft_answer", "")
     count = state.get("revision_count", 0)
 
-    # 폴백 모드: 하네스 없는 단순 프롬프트로 qwen 검수
+    # 폴백 모드: 하네스 없는 단순 프롬프트로 qwen 간이 검수
     if state.get("fallback_mode", False):
         print("⚠️ [Critic] 폴백 모드 — qwen 간이 검수 실행")
         simple_prompt = (
@@ -950,60 +1296,76 @@ def critic_node(state: AgentState):
             decision = local_llm.invoke(simple_prompt).content.strip().upper()
             if "PASS" in decision:
                 print("✅ [Critic] qwen 간이 검수 통과!")
-                return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+                return {"final_answer": draft_answer, "critic_feedback": json.dumps({"pass": True}, ensure_ascii=False)}
             else:
-                print(f"❌ [Critic] qwen 간이 검수 반려: {decision}")
-                return {"critic_feedback": "FAIL: 답변이 질문을 충분히 다루지 못했습니다.", "revision_count": count + 1}
+                print(f"❌ [Critic] qwen 간이 검수 반려")
+                fb = {"pass": False, "reasons": ["답변이 질문을 충분히 다루지 못함"], "fix_targets": ["질문의 핵심에 직접 답변하세요"]}
+                return {"critic_feedback": json.dumps(fb, ensure_ascii=False), "revision_count": count + 1}
         except Exception as e:
             print(f"⚠️ [Critic] qwen 간이 검수 실패 → 자동 PASS: {e}")
-            return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+            return {"final_answer": draft_answer, "critic_feedback": json.dumps({"pass": True}, ensure_ascii=False)}
 
-    if count >= 1:
-        print("🚨 [Critic] 수정 한도 도달. 시스템 과부하 방지를 위해 강제 PASS!")
-        return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+    # 수정 한도 도달 (Phase 1: 2회) → 강제 PASS
+    if count >= 2:
+        print("🚨 [Critic] 수정 한도 도달(2회). 강제 PASS!")
+        return {"final_answer": draft_answer, "critic_feedback": json.dumps({"pass": True}, ensure_ascii=False)}
 
-    # general_agent 답변은 짧은 대화 — Critic 불필요, 바로 통과
+    # general_agent 답변은 짧은 대화 — Critic 불필요
     if state.get("target_agent_name") == "general_agent":
         print("✅ [Critic] 일반 대화 — 검수 생략")
-        return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+        return {"final_answer": draft_answer, "critic_feedback": json.dumps({"pass": True}, ensure_ascii=False)}
 
-    # 코딩 응답에 코드 블록이 없으면 즉시 FAIL (결정론적, LLM 불필요)
+    # 코딩 응답에 코드 블록 없으면 즉시 FAIL (결정론적)
     if state.get("target_agent_name") == "coding_math_agent" and "```" not in draft_answer:
-        msg = "FAIL: 코드 블록(```)이 누락되었습니다. 반드시 실제 코드를 ```언어명 ... ``` 형식으로 포함하세요."
         print(f"❌ [Critic] 코드 블록 없음 → 즉시 반려")
-        return {"critic_feedback": msg, "revision_count": count + 1}
+        fb = {
+            "pass": False,
+            "reasons": ["코드 블록(```) 누락"],
+            "fix_targets": ["반드시 실제 코드를 ```언어명 ... ``` 형식으로 포함하세요"],
+        }
+        return {"critic_feedback": json.dumps(fb, ensure_ascii=False), "revision_count": count + 1}
 
-    print(f"🧐 [Critic] Groq 엔진으로 품질 검사 중... (현재 수정: {count}회)")
-
-    # 앞 700자(구조 확인) + 뒤 300자(Next Step 확인)
-    if len(draft_answer) > 1000:
-        critic_draft = draft_answer[:700] + "\n...(중략)...\n" + draft_answer[-300:]
-    else:
-        critic_draft = draft_answer
-    prompt = CRITIC_SYSTEM_PROMPT.format(query=state.get("query", ""), draft=critic_draft)
+    print(f"🧐 [Critic] JSON 모드 품질 검사 중... (수정 {count}회)")
+    critic_draft = (draft_answer[:700] + "\n...(중략)...\n" + draft_answer[-300:]) if len(draft_answer) > 1000 else draft_answer
+    prompt = CRITIC_SYSTEM_PROMPT_JSON.format(query=state.get("query", ""), draft=critic_draft)
 
     try:
-        decision = _invoke_with_backoff(external_llm, prompt).content.strip().upper()
-        if "PASS" in decision:
+        json_llm = external_llm.bind(response_format={"type": "json_object"})
+        raw = _invoke_with_backoff(json_llm, prompt).content
+        result = json.loads(raw)
+        if result.get("pass"):
             print("✅ [Critic] 검수 통과!")
-            return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+            return {"final_answer": draft_answer, "critic_feedback": json.dumps(result, ensure_ascii=False)}
         else:
-            print(f"❌ [Critic] 검수 반려! 사유: {decision}")
-            return {"critic_feedback": decision, "revision_count": count + 1}
+            reasons = result.get("reasons", [])
+            print(f"❌ [Critic] 반려 — {', '.join(reasons)}")
+            return {"critic_feedback": json.dumps(result, ensure_ascii=False), "revision_count": count + 1}
     except Exception as e:
-        print(f"⚠️ [Critic] 에러 발생, 비상 통과 처리: {e}")
-        return {"final_answer": draft_answer, "critic_feedback": "PASS"}
+        print(f"⚠️ [Critic] 에러 → 비상 통과: {e}")
+        return {"final_answer": draft_answer, "critic_feedback": json.dumps({"pass": True}, ensure_ascii=False)}
 
 
 def revision_agent_node(state: AgentState):
     query = state["query"]
     draft = state.get("draft_answer", "")
-    feedback = state.get("critic_feedback", "")
     fallback_mode = state.get("fallback_mode", False)
-    # 재작성은 품질이 중요 — Critic 지적을 정확히 반영해야 하므로 70B 사용
     active_llm = local_llm if fallback_mode else coding_llm
 
-    print("🛠️ [개선/보충 대화병] Critic의 지적을 반영하여 초안을 긴급 수정합니다.")
+    # Phase 1: JSON 피드백에서 fix_targets 추출
+    try:
+        fb = json.loads(state.get("critic_feedback", "{}"))
+        reasons = fb.get("reasons", [])
+        fix_targets = fb.get("fix_targets", [])
+        feedback_text = ""
+        if reasons:
+            feedback_text += f"수정 사유: {', '.join(reasons)}\n"
+        if fix_targets:
+            feedback_text += f"수정 지시: {chr(10).join(f'- {t}' for t in fix_targets)}"
+        feedback_text = feedback_text.strip() or "전반적인 품질 개선"
+    except Exception:
+        feedback_text = state.get("critic_feedback", "전반적인 품질 개선")
+
+    print(f"🛠️ [개선/보충 대화병] Critic 지적 반영 수정 중... | {feedback_text[:60]}")
 
     prompt = f"""[전 요원 필독 하네스 룰]\n{get_dynamic_harness()}\n
 당신은 답변 수정 요원입니다.
@@ -1011,24 +1373,29 @@ def revision_agent_node(state: AgentState):
 [원본 답변]:
 {draft}
 
-🚨 [지적사항]: {feedback}
+🚨 [지적사항]:
+{feedback_text}
 
 [사용자 질문]: {query}
 
 규칙:
-- 위 [원본 답변]에서 [지적사항]에 해당하는 부분만 최소한으로 수정하세요.
-- 지적받지 않은 부분은 원문 그대로 유지하세요. 멀쩡한 내용을 바꾸거나 삭제하지 마세요.
-- JSON, 대시보드 데이터는 포함하지 마세요. (시스템이 자동 처리)
-- 서론("수정된 답변:", "아래와 같이" 등) 없이 수정된 본문만 출력하세요."""
+- [지적사항]에 해당하는 부분만 최소한으로 수정하세요.
+- 지적받지 않은 부분은 원문 그대로 유지하세요.
+- JSON, 대시보드 데이터는 포함하지 마세요.
+- 서론("수정된 답변:" 등) 없이 수정된 본문만 출력하세요."""
 
     response = _invoke_with_backoff(active_llm, prompt).content
     return {"draft_answer": response}
 
 
 def check_critic_approval(state: AgentState):
-    if "PASS" in state.get("critic_feedback", ""):
-        return "end"
-    return "revision"
+    raw = state.get("critic_feedback", "")
+    try:
+        fb = json.loads(raw)
+        return "end" if fb.get("pass") else "revision"
+    except Exception:
+        # 레거시 문자열 포맷 호환
+        return "end" if "PASS" in raw.upper() else "revision"
 
 
 # ==========================================
@@ -1043,11 +1410,11 @@ def custom_agent_gate_node(state: AgentState):
     draft = state.get("draft_answer", "")
     history_str = format_history(state.get("history", []))
     fallback_mode = state.get("fallback_mode", False)
-    active_llm = local_llm if fallback_mode else expert_llm  # 70B 품질 우선, 소진 시 로컬 폴백
 
     # 1. 수동 선택된 에이전트 우선
     agent_name = state.get("custom_agent_name", "")
     agent_prompt = state.get("custom_agent_prompt", "")
+    agent_type = state.get("custom_agent_type", "EXTERNAL_API")  # LOCAL / EXTERNAL_API
 
     # 2. 수동 선택 없으면 자동 매칭
     if not agent_name or not agent_prompt:
@@ -1081,7 +1448,9 @@ def custom_agent_gate_node(state: AgentState):
             for score, agent in passing_agents:
                 a_name = agent["name"]
                 a_prompt_text = agent["description"]
-                print(f"  → '{a_name}' (유사도: {score:.2f}, 임계값: {agent.get('threshold', _CUSTOM_AGENT_AUTO_THRESHOLD):.2f})")
+                a_type = agent.get("agent_type", "EXTERNAL_API")
+                a_llm = local_llm if (fallback_mode or a_type == "LOCAL") else expert_llm
+                print(f"  → '{a_name}' ({a_type}, 유사도: {score:.2f})")
                 prompt = CUSTOM_AGENT_PROMPT.format(
                     agent_name=a_name,
                     agent_prompt=a_prompt_text,
@@ -1089,7 +1458,7 @@ def custom_agent_gate_node(state: AgentState):
                     query=query,
                 )
                 try:
-                    response = _invoke_with_backoff(active_llm, prompt).content.strip()
+                    response = _invoke_with_backoff(a_llm, prompt).content.strip()
                     multi_responses.append({"name": a_name, "response": response})
                 except Exception as e:
                     print(f"  ⚠️ '{a_name}' 실패 (무시): {e}")
@@ -1099,9 +1468,12 @@ def custom_agent_gate_node(state: AgentState):
         best_score, best_agent = passing_agents[0]
         agent_name = best_agent["name"]
         agent_prompt = best_agent["description"]
-        print(f"🎭 [커스텀 에이전트 자동 선택] '{agent_name}' (유사도: {best_score:.2f})")
+        agent_type = best_agent.get("agent_type", "EXTERNAL_API")
+        print(f"🎭 [커스텀 에이전트 자동 선택] '{agent_name}' ({agent_type}, 유사도: {best_score:.2f})")
 
-    print(f"🎭 [커스텀 에이전트: {agent_name}] 관점 추가 중...")
+    # 수동 선택 + 자동 단일 매칭 공통: agent_type으로 LLM 결정
+    active_llm = local_llm if (fallback_mode or agent_type == "LOCAL") else expert_llm
+    print(f"🎭 [커스텀 에이전트: {agent_name}] {'로컬 LLM' if agent_type == 'LOCAL' else '외부 API'} 으로 관점 추가 중...")
     prompt = CUSTOM_AGENT_PROMPT.format(
         agent_name=agent_name,
         agent_prompt=agent_prompt,

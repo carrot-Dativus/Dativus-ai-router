@@ -59,6 +59,7 @@ class ChatRequest(BaseModel):
     force_agent: Optional[str] = None          # 빌트인 강제 라우팅 (general_agent / expert_agent / coding_math_agent)
     target_agent_name: Optional[str] = None    # 커스텀 에이전트 이름 (수동 선택)
     target_agent_prompt: Optional[str] = None  # 커스텀 에이전트 성격/역할 (수동 선택)
+    target_agent_type: Optional[str] = None    # 커스텀 에이전트 엔진 (LOCAL / EXTERNAL_API)
     custom_agents_list: Optional[list] = []    # 자동 매칭용 전체 커스텀 에이전트 목록
     existing_dashboard: Optional[dict] = None
     # Phase 1 개인화: 드롭다운 3개 + 자유 입력 메모
@@ -131,7 +132,7 @@ async def chat_with_ai(
         "workspace_id": workspace_id,
         "user_id": user_id
     }
-    result = await asyncio.to_thread(langgraph_app.invoke, inputs)
+    result = await asyncio.to_thread(langgraph_app.invoke, inputs, {"recursion_limit": 50})
 
     latency = round(time.time() - start_time, 2)
     final_answer = result.get("final_answer", "")
@@ -270,6 +271,7 @@ async def chat_with_ai_stream(
             "force_agent": body.force_agent or "",
             "custom_agent_name": body.target_agent_name or "",
             "custom_agent_prompt": body.target_agent_prompt or "",
+            "custom_agent_type": body.target_agent_type or "",
             "custom_agents_list": body.custom_agents_list or [],
             "existing_dashboard": body.existing_dashboard or {},
             "persona_expertise": body.persona_expertise or "",
@@ -290,6 +292,13 @@ async def chat_with_ai_stream(
             "web_search":           "웹 검색병",
             "graph_memory":         "관계망 추론병",
             "expert_agent":         "전문 분석병",
+            # Phase 1 검색 인텔리전스 노드
+            "query_rewriter":       "쿼리 재작성",
+            "selective_search":     "선택적 검색",
+            "search_grader":        "검색 품질 평가",
+            "expert_agent_react":   "전문 추론병(ReAct)",
+            "expert_tools":         "도구 실행",
+            # 공통 후처리
             "dashboard_select":     "대시보드 분석",
             "summary":              "문서 요약병",
             "critic":               "품질 검수 요원",
@@ -370,11 +379,24 @@ async def chat_with_ai_stream(
                                 await asyncio.sleep(0.01)
                             elif node_name == "critic":
                                 critic_result = output.get("critic_feedback") if is_dict else None
-                                if critic_result == "PASS":
-                                    yield f"data: [LOG]✅ [품질 검수 요원] 검수 통과! 완벽한 답변입니다.\n\n"
-                                else:
-                                    safe_feedback = str(critic_result or "").replace('\n', ' ')
-                                    yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려 및 재작성 지시: {safe_feedback}\n\n"
+                                critic_passed = False
+                                if critic_result:
+                                    try:
+                                        import json as _json
+                                        fb = _json.loads(critic_result)
+                                        critic_passed = bool(fb.get("pass"))
+                                        if critic_passed:
+                                            yield f"data: [LOG]✅ [품질 검수 요원] 검수 통과! 완벽한 답변입니다.\n\n"
+                                        else:
+                                            reasons = ", ".join(fb.get("reasons", []))
+                                            yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려: {reasons}\n\n"
+                                    except Exception:
+                                        # 레거시 문자열 포맷 호환
+                                        critic_passed = "PASS" in str(critic_result).upper()
+                                        if critic_passed:
+                                            yield f"data: [LOG]✅ [품질 검수 요원] 검수 통과!\n\n"
+                                        else:
+                                            yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려\n\n"
                             elif node_name == "custom_agent_gate" and is_dict:
                                 multi = output.get("multi_agent_responses", [])
                                 if multi:
@@ -393,9 +415,16 @@ async def chat_with_ai_stream(
                             for pending_log in pop_pending_logs():
                                 yield f"data: [LOG]{pending_log}\n\n"
 
-                            # 💡 여기도 안전 검증을 수행합니다.
+                            # critic 통과 시 답변 스트리밍 — JSON 형식 파싱
                             critic_result = output.get("critic_feedback") if is_dict else None
-                            if node_name == "critic" and critic_result == "PASS":
+                            _critic_passed = False
+                            if critic_result:
+                                try:
+                                    import json as _json
+                                    _critic_passed = bool(_json.loads(critic_result).get("pass"))
+                                except Exception:
+                                    _critic_passed = "PASS" in str(critic_result).upper()
+                            if node_name == "critic" and _critic_passed:
                                 # 대시보드 데이터가 있으면 텍스트보다 먼저 전송
                                 if current_dashboard_data:
                                     import json as _json
